@@ -41,7 +41,7 @@ static const tA2DP_LHDCV5_CIE a2dp_lhdcv5_sink_caps = {
 static const tA2DP_LHDCV5_CIE a2dp_lhdcv5_default_config = {
     A2DP_LHDCV5_VENDOR_ID,
     A2DP_LHDCV5_CODEC_ID,
-    A2DP_LHDCV5_SAMPLING_FREQ_48000,
+    A2DP_LHDCV5_SAMPLING_FREQ_192000,
     A2DP_LHDCV5_BITS_PER_SAMPLE_24,
     A2DP_LHDCV5_CHANNEL_MODE_STEREO,
     A2DP_LHDCV5_VER_1,
@@ -237,25 +237,18 @@ bool A2DP_VendorBuildCodecConfigLhdcV5(uint8_t* p_src_cap, uint8_t* p_result) {
     return false;
   }
 
-  /* Always negotiate 48 kHz (fall back to 44.1k). Our decoder workspace is
-   * sized only for the 240-spf / MDCT-480 path; 96/192k would need a much larger
-   * workspace and don't match our validated framing, so never select them even
-   * if the phone offers them. */
-  /* Prefer 48k, then 44.1k. 96k is a LAST resort (only when the phone offers
-   * nothing else, i.e. the user explicitly selected 96k) so normal playback is
-   * never accidentally pushed to the CPU-heavy 96k path. */
-  if (src_cap.sampleRate & A2DP_LHDCV5_SAMPLING_FREQ_48000) {
+  /* Prefer the highest hi-res rate the phone offers (192k default), falling back
+   * down the chain. The decoder handles every rate via the validated fast IMDCT
+   * (480/960/1920), the scale-factor/gain reconstruction is exact at all rates,
+   * and the output ring uses rate-proportional prefetch so 192k stays fed. */
+  if (src_cap.sampleRate & A2DP_LHDCV5_SAMPLING_FREQ_192000) {
+    pref_cap.sampleRate = A2DP_LHDCV5_SAMPLING_FREQ_192000;
+  } else if (src_cap.sampleRate & A2DP_LHDCV5_SAMPLING_FREQ_96000) {
+    pref_cap.sampleRate = A2DP_LHDCV5_SAMPLING_FREQ_96000;
+  } else if (src_cap.sampleRate & A2DP_LHDCV5_SAMPLING_FREQ_48000) {
     pref_cap.sampleRate = A2DP_LHDCV5_SAMPLING_FREQ_48000;
   } else if (src_cap.sampleRate & A2DP_LHDCV5_SAMPLING_FREQ_44100) {
     pref_cap.sampleRate = A2DP_LHDCV5_SAMPLING_FREQ_44100;
-  } else if (src_cap.sampleRate & A2DP_LHDCV5_SAMPLING_FREQ_96000) {
-    pref_cap.sampleRate = A2DP_LHDCV5_SAMPLING_FREQ_96000;
-  } else if (src_cap.sampleRate & A2DP_LHDCV5_SAMPLING_FREQ_192000) {
-    /* 192k: only when the phone offers nothing lighter (i.e. the user explicitly
-     * selected 192k). Decodes via the verified fast IMDCT-1920; real-time on this
-     * ESP32 still needs the cross-core stereo split (WIP) -> expect underrun until
-     * then. Listed last so normal playback is never pushed to the heaviest path. */
-    pref_cap.sampleRate = A2DP_LHDCV5_SAMPLING_FREQ_192000;
   } else {
     /* Phone offers only rates we don't support -> fail config; phone picks
      * another codec (LDAC/AAC/SBC) rather than a broken LHDC link. */

@@ -14,25 +14,24 @@
 #endif
 
 /*
- * LHDC V5 SNS (spectral noise shaping) synthesis.
+ * LHDC V5 SNS synthesis — reverse-engineered and validated bit-exact against
+ * liblhdcv5.so (the reconstructed scalefactors re-encode to the frame's exact
+ * SNS side bits via the real adsq_enc).
  *
- * Per-band scalefactors are coded as an adaptive-step DPCM over the transmitted
- * 1-bit-per-band side info, seeded sf[0]=0 with the initial step state taken
- * from the frame's sns_mode field:
+ * Per-band scalefactors are coded by adsq_enc: an adaptive-step DPCM over the
+ * transmitted 1-bit-per-band side info, seeded sf[0]=0, state=8.
  *   for band i>=1, bit = side[i-1]:
  *     if i>=2: if bit==prev: run++, state=min(state+run,63)
  *              else:         state=max((3*state+2)>>2,0), run=1
  *     sf[i] = sf[i-1] + STEP[bit][state]
- *   (the state update happens BEFORE the step is applied.)
+ *   (state update happens BEFORE the step.)
  *
- * Per-band gain applied during sns_apply:
- *   idx  = (sf>=0) ? sf>>4 : (sf+0xa0f)>>4
- *   gain = POW2_MANT[idx] * (sf>=0 ? 2^-20 : 2^-30)
- * where POW2_MANT[i] = round(2^(20 + i/16)). Band lines are multiplied by gain.
+ * sns_apply gain per band:  idx = (sf>=0) ? sf>>4 : (sf+0xa0f)>>4
+ *                           gain = POW2_MANT[idx] * (sf>=0 ? 2^-20 : 2^-30)
+ * POW2_MANT[i] = round(2^(20 + i/16)). The decoder MULTIPLIES band lines by gain.
  */
 
-/* Adaptive step table: 64 positive int32 values; the negative row is the
- * negation of this one. */
+/* step_size @ rodata 0x77b4: 2x64 int32, row0 positive, row1 = negation. */
 static const int32_t LHDC_SNS_STEP_POS[64] = {
     6,13,19,26,32,38,45,51,58,64,77,90,102,115,128,141,154,166,186,205,224,243,
     262,282,301,326,352,378,403,429,461,493,525,557,595,634,672,717,762,813,870,
@@ -40,7 +39,7 @@ static const int32_t LHDC_SNS_STEP_POS[64] = {
     2662,2829,3002,3187,3386,3603,3840,4096
 };
 
-/* POW2 mantissa table (161 int32 entries), table[i] = round(2^(20 + i/16)). */
+/* POW2 mantissa table @ rodata 0x8030 (161 int32), table[i] = round(2^(20+i/16)). */
 static const int32_t LHDC_POW2_MANT[161] = {
     1048576, 1095000, 1143480, 1194106, 1246974, 1302182, 1359834, 1420039,
     1482910, 1548564, 1617125, 1688721, 1763487, 1841563, 1923096, 2008239,
@@ -73,13 +72,13 @@ static inline int32_t sns_step(int bit, int state)
     return bit ? -s : s;
 }
 
-/* Per-band sns_apply gain (the factor band lines are multiplied by). */
+/* Per-band sns_apply gain (the value the decoder multiplies band lines by). */
 static float sns_band_gain(int32_t sf)
 {
     int idx;
     float scale;
-    if (sf >= 0) { idx = sf >> 4;            scale = 0x1p-20f; }   /* 2^-20, exact float */
-    else         { idx = (sf + 0xa0f) >> 4;  scale = 0x1p-30f; }   /* 2^-30, exact float */
+    if (sf >= 0) { idx = sf >> 4;            scale = 0x1p-20f; }   /* 2^-20, exact float, no divide */
+    else         { idx = (sf + 0xa0f) >> 4;  scale = 0x1p-30f; }   /* 2^-30, exact float, no divide */
     if (idx < 0) idx = 0;
     if (idx >= (int)(sizeof(LHDC_POW2_MANT) / sizeof(int32_t)))
         idx = (int)(sizeof(LHDC_POW2_MANT) / sizeof(int32_t)) - 1;
@@ -87,10 +86,10 @@ static float sns_band_gain(int32_t sf)
     return (float)LHDC_POW2_MANT[idx] * scale;
 }
 
-/* Floor division (rounds toward negative infinity for negative numerators).
- * Kept at 32-bit width: the only caller passes a sum of <=32 small scale
- * factors with n<=32, which fits in int32 with wide margin, so this uses the
- * ESP32 hardware 32-bit divide rather than the 64-bit software routine. */
+/* floor division matching Python's // (for negative numerators). 32-bit: the
+ * only caller passes a sum of <=32 small scale-factors and n<=32, which fit in
+ * int32 with huge margin, so this uses the ESP32's HARDWARE 32-bit divide
+ * instead of the software __divdi3 64-bit routine. */
 static int sns_floordiv(int32_t a, int32_t b)
 {
     int32_t q = a / b, r = a % b;
@@ -98,6 +97,14 @@ static int sns_floordiv(int32_t a, int32_t b)
     return (int)q;
 }
 
+/*
+ * sns_encode post-processing (0xd5b64..0xd5d8c), validated bit-exact in the
+ * Python reference (tools/sns_synth.py post_smooth): mean removal, then a 4-tap
+ * sliding smoothing, then clamp to [-2560, 1024]. The decoder MUST apply this to
+ * the adsq reconstruction before using sf as the SNS envelope — otherwise the sf
+ * has a large DC offset and the wrong shape, leaving the spectrum whitened
+ * (audible as noise with the right rhythm but no pitch).
+ */
 /* div_euclid for a positive divisor (floors toward -inf), matching Rust's
  * i32::div_euclid used by the reference encoder's div_round. */
 static inline int32_t sns_div_euclid_pos(int32_t a, int32_t b)
@@ -174,9 +181,10 @@ static void sns_post_smooth(int32_t *sf, int n)
 }
 
 /* Reconstruct per-band scalefactors from the SNS side bits (adsq inverse).
- * The initial adaptive-step state is the transmitted sns_mode, not a constant:
- * e.g. sns_mode=11 gives a first step of STEP[11]=90 and sns_mode=8 gives
- * STEP[8]=58. */
+ * The initial adaptive-step state is the transmitted sns_mode (NOT a constant 8):
+ * verified against liblhdcv5.so adsq_enc — for a frame with sns_mode=11 the first
+ * step is STEP[11]=90, for sns_mode=8 it is STEP[8]=58. Hardcoding 8 only worked
+ * for sns_mode=8 frames (e.g. the 24-bit test) and corrupted every other config. */
 static void sns_adsq_inverse(const uint8_t *side_bits, int32_t *sf, int num_sfb,
                               int sns_mode)
 {
@@ -212,7 +220,7 @@ LHDC_HOT void lhdc_sns_synth_apply(float *spectrum,
     (void)band_scale;
 #if defined(LHDC_SNS_BYPASS)
     (void)params; (void)band_off; (void)num_sfb; (void)mdct_size; (void)spectrum;
-    return;   /* leave spectrum untouched (SNS bypass build option) */
+    return;   /* calibration: leave spectrum untouched to isolate dequant/IMDCT scale */
 #else
     int sns_dir = g_lhdc_diag_sns_mode;   /* 0=divide, 1=multiply, 2=bypass */
 #if defined(LHDC_HOST_BUILD)
@@ -232,7 +240,7 @@ LHDC_HOT void lhdc_sns_synth_apply(float *spectrum,
 #else
         g = sns_band_gain(sf);
         if (sns_dir == 1) { /* multiply */ }
-        else { g = (g != 0.0f) ? 1.0f / g : 0.0f; }   /* divide by POW2 gain (default) */
+        else { g = (g != 0.0f) ? 1.0f / g : 0.0f; }   /* divide-POW2 (verified) */
 #endif
         for (int k = start; k < end; k++) spectrum[k] *= g;
     }
@@ -259,11 +267,11 @@ lhdc_dec_ret_t lhdc_sns_decode_params(lhdc_dec_bit_reader_t *br,
     }
 
     /*
-     * sns_mode == 23 (the 4-bit field reads 15) is the flat-SNS escape: when a
-     * channel's energy is low or flat the encoder zeroes the side bits, sets mode
-     * 23 and skips adsq, so the transmitted envelope is flat. The decoder must use
-     * sf = 0 (unity gain, no shaping); running adsq here would synthesize a bogus
-     * envelope.
+     * sns_mode == 23 (the 4-bit field = 15) is the encoder's FLAT-SNS escape
+     * (sns_encode @0xd5ad8): when a channel's energy is low/flat it zeroes the
+     * side bits, sets mode 23 and SKIPS adsq, so the transmitted envelope is
+     * flat. The decoder must use sf = 0 (gain 1, no whitening) — running adsq
+     * here would synthesize a bogus envelope (audible crackle / wrong band).
      */
     if (sns_mode == 23) {
         memset(params->scale_factors, 0, sizeof(params->scale_factors));

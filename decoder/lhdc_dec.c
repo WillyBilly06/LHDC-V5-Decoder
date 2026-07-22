@@ -19,19 +19,20 @@
   #include "esp_attr.h"
 #endif
 
-/* Place the hot per-element decode loops in IRAM. At 96k (N=960) the decode is
- * close to the real-time budget, so flash-cache misses caused by the Bluetooth
- * controller's interrupts can push individual frames over budget and cause
- * underruns. Executing from IRAM removes that jitter. (Host build: no-op.) */
+/* Hot per-element decode loops placed in IRAM: at 96k (N=960, 2x the work of
+ * 48k in the same 5ms frame) the decode runs ~86% of budget, so flash-cache
+ * misses under the BT controller's IRQs spike individual frames over budget ->
+ * underrun -> pops/skips. IRAM removes that jitter. (HOST build: no-op.) */
 #if defined(LHDC_HOST_BUILD)
   #define LHDC_HOT
 #else
   #define LHDC_HOT IRAM_ATTR
 #endif
 
-/* Optional stage profiler: times the per-channel decode stages (entropy, IMDCT,
- * remainder). The periodic log output stalls the decode task on the UART and
- * disturbs audio, so it is disabled by default; set to 1 for bring-up only. */
+/* Stage profiler: cheap on-device timing of the per-channel decode stages so we
+ * can see where the real-time budget goes (IMDCT vs entropy vs the rest).
+ * The periodic PROF ESP_LOGI stalls the decode task ~9 ms on the UART and
+ * stutters audio, so it is OFF by default; set to 1 for bring-up only. */
 #define LHDCV5_DEC_PROFILE 0
 #if defined(LHDC_HOST_BUILD)
   #define LHDC_NOW_US() 0LL
@@ -39,20 +40,22 @@
   #define LHDC_NOW_US() esp_timer_get_time()
 #endif
 
-/* 96k output level. Must be 1.0: the IMDCT 1/M normalization already yields the
- * correct level, so a full-scale source decodes to full scale. A boost above 1.0
- * would push loud content past full scale, where LHDC_OUT_SAMPLE hard-clips it
- * into continuous buzzing. System/device volume covers any small level offset. */
+/* 96k output level. MUST be 1.0: the IMDCT 1/M normalization (self-test-verified
+ * == the exact 2/N formula) already yields the correct level, so a full-scale
+ * source decodes to full scale. A >1.0 boost (was 1.10 for a subjective LDAC
+ * level-match) pushes loud content — e.g. a near-0 dBFS test tone / frequency
+ * generator — PAST full scale, where LHDC_OUT_SAMPLE hard-clips it → continuous
+ * buzzy static. Not worth clipping for ~0.8 dB; system/phone volume covers it. */
 #define LHDC_96K_GAIN 1.0f
 
-/* One-shot decode trace: set to 1 by the caller at stream start; the decoder
+/* One-shot decode trace: set to 1 by the wrapper at stream start; the decoder
  * logs the first frame's leading-section values, then self-clears. Diagnostic. */
 volatile int g_lhdc_trace = 0;
 
 /*
- * Frame scramble: the first 8 payload bytes are permuted (permutation selected
- * by payload[8]&1) and XOR-masked. Byte 8 onward is plaintext. The decoder
- * inverts this in place.
+ * Frame scramble (PROJECT_CONTEXT §6, validated against 2400 real frames):
+ * the first 8 payload bytes are permuted (perm selected by payload[8]&1) and
+ * XOR-masked. Byte 8 onward is plaintext. The decoder inverts this in place.
  */
 static const uint8_t LHDC_XOR_MASK[8] = {
     0xFF, 0xE7, 0x7A, 0xB3, 0xDA, 0xE5, 0xCD, 0x73
@@ -61,20 +64,22 @@ static const uint8_t LHDC_XOR_MASK[8] = {
 /*
  * Shared IMDCT window cache. The Princen-Bradley window depends only on
  * mdct_size and is read-only after generation, so one copy is shared across all
- * decoder instances rather than stored per instance. Regenerated only when
- * mdct_size changes. Not re-entrant, but the A2DP sink decodes on a single task.
- *
- * For 480 the window is a const flash table (lhdc_get_window_const), so no RAM
- * copy is needed. Other sizes fall back to a lazily allocated buffer.
+ * decoder instances instead of living in each ~per-instance workspace (saves
+ * MAX_MDCT floats of heap). Regenerated only when mdct_size changes.
+ * Not re-entrant, but A2DP sink decodes on a single task.
  */
+/* For 480 (the only negotiated config) the window is a const flash table
+ * (lhdc_get_window_const) -> no RAM copy. Any other size falls back to a lazily
+ * malloc'd buffer (never hit today; kept for future 96/192k). */
 static float   *s_imdct_window = NULL;
 static int      s_imdct_window_size = 0;
 
 static const float *lhdc_dec_get_window(int mdct_size)
 {
 #if defined(LHDC_HOST_BUILD)
-    /* Host-only hook: load the synthesis window from a raw float32 file
-     * (LHDC_WINFILE) so candidate windows can be tested without recompiling. */
+    /* Host-only A/B hook: load the synthesis window verbatim from a raw float32
+     * file (LHDC_WINFILE) so candidate 960/1920 windows can be tested against the
+     * real encoder round-trip without recompiling. */
     { const char *wf = getenv("LHDC_WINFILE");
       if (wf) {
           static float s_winfile[2048]; static int s_winfile_n = 0;
@@ -87,13 +92,15 @@ static const float *lhdc_dec_get_window(int mdct_size)
 #endif
     const float *cw = lhdc_get_window_const(mdct_size);
     if (cw) {                                  /* flash window for this size -> zero RAM */
-        /* This size uses the flash const window, so free any RAM window kept from
-         * a previous higher rate (e.g. after a 96k->48k switch). */
+        /* Release any RAM window kept from a previous higher rate (e.g. after
+         * switching 96k->48k): 48k uses the flash const window, so the malloc'd
+         * buffer is dead weight. Free it back to the heap. */
         if (s_imdct_window) { free(s_imdct_window); s_imdct_window = NULL; s_imdct_window_size = 0; }
         return cw;
     }
     if (mdct_size != s_imdct_window_size && mdct_size <= LHDC_DEC_MAX_MDCT_SIZE) {
-        /* Allocate exactly this rate's window. Reallocate on a size change. */
+        /* Allocate EXACTLY this rate's window (not MAX_MDCT): 96k needs 960 floats
+         * (3.8 KB), not 1920 (7.7 KB). Reallocate on a size change. */
         if (s_imdct_window) { free(s_imdct_window); s_imdct_window = NULL; }
         s_imdct_window = (float *)malloc(sizeof(float) * (size_t)mdct_size);
         if (!s_imdct_window) { s_imdct_window_size = 0; return NULL; }
@@ -109,16 +116,16 @@ void lhdc_dec_free_window(void)
 {
     if (s_imdct_window) { free(s_imdct_window); s_imdct_window = NULL; s_imdct_window_size = 0; }
 }
-
 /* perm[k] = source byte index that lands at position k after descrambling. */
 static const uint8_t LHDC_PERM[2][8] = {
     { 4, 0, 1, 5, 7, 3, 2, 6 },
     { 6, 3, 7, 0, 2, 1, 4, 5 },
 };
 
-/* Descramble one channel's leading 8 bytes in place. Each channel's header is
- * scrambled independently, so every channel section — not just the first — must
- * be descrambled before its bit reader runs. */
+/* Descramble one channel's leading 8 bytes IN PLACE. The encoder scrambles
+ * EACH channel's header independently (lhdc_v5_enc_encode @0xd2598 scrambles
+ * regions 6 and 7 separately), so every channel section — not just the first —
+ * needs this before its bit reader runs. */
 static void lhdc_descramble_inplace_sel(uint8_t *buf, size_t avail, int sel)
 {
     if (avail < 9) return;
@@ -154,15 +161,15 @@ static void lhdc_descramble(const uint8_t *in, uint8_t *out, size_t len)
 }
 
 /*
- * Parse one LHDC V5 frame.
+ * Parse one LHDC V5 frame (PROJECT_CONTEXT §5/§6, validated).
  *
  * A frame is [u16 LE header][payload]:
  *   payload_len = (hdr & 0x3FF) * 2
  *   flags       = hdr >> 10   (=1 for 48k/5ms stereo)
- * There is no per-frame sync word or codec-parameter header; the stream format
+ * There is no per-frame sync word or codec-param header; the stream format
  * (sample rate, channels, bit depth, frame duration) comes from the A2DP CIE
- * captured in dec->config. The payload is copied into dec->payload_buf, where
- * the per-channel bit reader later operates on it.
+ * captured in dec->config. The payload's first 9 bytes are descrambled into
+ * dec->payload_buf, on which the per-channel bit reader then operates.
  *
  * Returns the number of input bytes consumed (header + payload) via *consumed.
  */
@@ -202,11 +209,12 @@ static lhdc_dec_ret_t lhdc_dec_parse_header(lhdc_decoder_t *dec,
 
     /*
      * New PCM samples emitted per frame = the MDCT hop = mdct_size/2 (the
-     * overlap; see lhdc_dec_overlap_add). The emit count is derived from the
-     * band config's MDCT size rather than the time-based count
-     * (sample_rate*dur/1000): the two coincide at 48/96/192k, but at 44.1k the
-     * time-based value is 220 instead of 240, which would drop samples and shift
-     * pitch. Using mdct_size/2 keeps every rate at the correct playback speed.
+     * overlap, see lhdc_dec_overlap_add). The time-based spf
+     * (sample_rate*dur/1000) happens to equal mdct_size/2 for 48/96/192k, but
+     * at 44.1k it gives 220 instead of 240 — so 20 of the 240 overlap-added
+     * samples per frame were silently dropped, compressing the audio and
+     * raising pitch by exactly 48000/44100 = 8.8%. Derive the emit count from
+     * the band config's MDCT size so every rate plays at the right speed.
      */
     const lhdc_band_cfg_desc_t *bcfg = lhdc_get_band_cfg(
         hdr->sample_rate, hdr->frame_duration_ms);
@@ -214,10 +222,11 @@ static lhdc_dec_ret_t lhdc_dec_parse_header(lhdc_decoder_t *dec,
     hdr->samples_per_channel = (uint16_t)(bcfg->mdct_size / 2);
 
     /* Copy the raw payload into the scratch buffer. Each channel's 8-byte header
-     * is descrambled later in decode_channel, so the descramble selector can be
-     * retried per channel. */
+     * is descrambled later in decode_channel (uniformly, so the selector can be
+     * retried per channel). */
     memcpy(dec->payload_buf, in_data + 2, payload_len);
 
+    /* The per-channel bit reader runs over the descrambled payload. */
     lhdc_bit_reader_init(&dec->bit_reader, dec->payload_buf, payload_len);
 
 #if defined(LHDC_HOST_BUILD)
@@ -240,28 +249,18 @@ static lhdc_dec_ret_t lhdc_dec_parse_header(lhdc_decoder_t *dec,
 }
 
 /*
- * Global-gain exponent e(gain_idx). The encoder quantizes the SNS-shaped
- * spectrum by q[k] = round(spectrum[k] * 2^-e(gidx)); the decoder dequantizes
- * linearly: spectrum[k] = q[k] * 2^e(gidx).
+ * Global-gain exponent e(gain_idx), reversed from GenerateGainTable /
+ * EncGainByTable (PROJECT_CONTEXT §11). The encoder quantizes the whole
+ * SNS-shaped spectrum by q[k] = round(spectrum[k] * 2^-e(gidx)); the decoder
+ * dequantizes linearly: spectrum[k] = q[k] * 2^e(gidx).
  *
- * Ported bit-exactly from the reference decoder's level table (Android lhdcv5
- * Rust, src/common/lhdc_level.rs `LevelTable::init`/`calc`). The gain table is a
- * piecewise-linear curve of gain_idx:
- *   offset_max = a - (a-c)/575 * (L-50)   (a,c depend on bit depth AND rate)
- *   start      = trunc(offset_max / D)     (D = 4 for 24-bit, 2.5 for 16-bit)
- *   jump       = (offset_max - start) / (503 - start)   [503 = OFFSET_MAX-1]
- *   e(idx):  idx <= start           : idx
- *            start < idx <= 504      : start + (idx-start)*jump
- *            idx > 504               : start + (504-start)*jump + (idx-504)
- *            (clamped to 30)         [OFFSET_MAX = 504]
- *
- * The per-rate (a,c): 24-bit 44.1/48k (26.2,16.4); 96k (25.7,20.75);
- * 192k (25.7,24.42). 16-bit 44.1k (26.15,16.42); 48k (26.18,16.32).
- *
- * NOTE: an earlier port used the 48k constants for every rate and force-set
- * slope=0.0378, which happened to track the *phone* encoder's gain approximately
- * but is wrong for the true 96k/192k curves -- with a correct encoder the 192k
- * dequant scale is badly off. This exact per-rate table is required.
+ * e(idx) is piecewise in the 512-entry gain table:
+ *   idx <= split        : e = idx
+ *   split < idx <= 503  : e = split + (idx-split)*slope
+ *   idx > 503           : e = e(503) + (idx-504), clamped to 30
+ * (split, slope) depend on frame length; for 48k/16-bit:
+ *   split = (int)(((L-50)*(-0.017144) + 26.18) / 2.5)
+ *   slope = (e_full - split) / (503 - split)   with e_full ~ 30
  */
 static float lhdc_dec_gain_exponent(int gain_idx, int enc_frame_len, int bit_depth,
                                     uint32_t sample_rate)
@@ -308,13 +307,13 @@ static float lhdc_dec_gain_exponent(int gain_idx, int enc_frame_len, int bit_dep
     return e;
 }
 
-/* Per-rate output level normalization. 44.1k/48k (mdct_size 480) decode at unity;
- * the reconstruction level falls ~1/N with the transform size N, so (mdct_size/480)
- * (480->x1, 960->x2, 1920->x4) restores a consistent, value-preserving level across
- * rates. NOTE: this is linear in N, not N^2. The previous (N/480)^2 over-amplified
- * the higher rates -- it was compensating the OLD (too-low) 96k/192k dequant gain;
- * with the exact per-rate gain table it drives 96k to full scale and 192k into
- * hard clipping. Linear rate_norm + the exact gain keeps every rate value-preserving. */
+/* Per-rate output level normalization. 44.1k/48k (mdct_size 480) decode at unity,
+ * but the reconstruction gain falls ~1/N^2 with the transform size N, so 96k
+ * (mdct 960) came out ~12 dB quieter and 192k (mdct 1920) ~24 dB quieter than
+ * 48k -- the volume DROPPED when switching to a higher sample rate. The old
+ * LHDC_96K_GAIN=1.0 hack never corrected it. Restore a consistent level with
+ * (mdct_size/480)^2 (480->x1, 960->x4, 1920->x16). Verified via the real-encoder
+ * round-trip: brings 96k/192k to within <0.5 dB of 48k. */
 static float lhdc_dec_rate_norm(int mdct_size)
 {
     float r = (float)mdct_size / 480.0f;
@@ -324,11 +323,16 @@ static float lhdc_dec_rate_norm(int mdct_size)
     return r;
 }
 
-/* Per-config output level calibration toward value-preserving output (0 dBFS in
- * -> 0 dBFS out) so every LHDC config plays at the same volume regardless of
- * sample rate / bit depth. These trims cancel the residual decode gain that
- * remains after rate_norm, measured per config. They are approximate
- * (signal-dependent within ~1-2 dB); LHDC_LEVELDB overrides on the host build. */
+/* Per-config output level calibration toward VALUE-PRESERVING (0 dBFS in ->
+ * 0 dBFS out) so every LHDC config — and thus every codec, since the standard
+ * decoders are already value-preserving — plays at the same volume regardless
+ * of sample rate / bit depth. Residual decode gain (after rate_norm) measured
+ * via near-transparent multitone round-trip through the real encoder
+ * (tools/lhdc_roundtrip busy=1 @900k, broadband RMS): 24-bit 48k +0.2, 96k +1.3,
+ * 44.1k +1.3, 192k -0.8 dB; 16-bit ~+5.6 dB (its gain table was never calibrated
+ * — the slope/split fixes were 24-bit only). These trims cancel it. NOTE:
+ * approximate (signal-dependent within ~1-2 dB); host env LHDC_LEVELDB overrides
+ * for re-calibration by ear. */
 static float lhdc_dec_level_cal(uint32_t sample_rate, int bit_depth)
 {
     float db = 0.0f;
@@ -350,8 +354,8 @@ static float lhdc_dec_level_cal(uint32_t sample_rate, int bit_depth)
 }
 
 /*
- * Inverse quantization: linear dequant by the global gain step,
- * spectrum[k] = q[k] * 2^e(gain_idx). The SNS per-band shaping is undone
+ * Inverse quantization (PROJECT_CONTEXT §11): linear dequant by the global gain
+ * step. spectrum[k] = q[k] * 2^e(gain_idx). The SNS per-band shaping is undone
  * separately in lhdc_sns_synth_apply.
  */
 static LHDC_HOT void lhdc_dec_inverse_quantize(int32_t *quant, float *spectrum,
@@ -404,9 +408,10 @@ static LHDC_HOT void lhdc_dec_overlap_add(lhdc_decoder_t *dec, float *pcm_out,
 }
 
 /*
- * FAC moving-average window 1 (the stream-2 window is win1*8). win1 = payload/2
- * for high-bitrate frames (enc_frame_len >= 160), else payload/4. `enc_frame_len`
- * is the per-frame payload byte count (hdr->frame_bytes).
+ * FAC moving-average window 1 (stream-2 window = win1*8). Validated 24/24
+ * across configs: win1 = payload/2 for high-bitrate frames (resid field == 4,
+ * i.e. enc_frame_len >= 160), else payload/4. `enc_frame_len` here is the
+ * per-frame payload byte count (hdr->frame_bytes).
  */
 static int lhdc_dec_ma_window(uint32_t sample_rate, int enc_frame_len)
 {
@@ -417,11 +422,14 @@ static int lhdc_dec_ma_window(uint32_t sample_rate, int enc_frame_len)
     return win1;
 }
 
-/* Number of bits needed to represent n. Uses unsigned and a hard cap of 31 so a
- * large/garbage magnitude can never overflow. Computed directly via
- * __builtin_clz (count leading zeros): calc_bits(u) = (u==0) ? 0 :
- * floor(log2(u))+1, capped at 31. Hot path, called per coefficient in the
- * mantissa plane; `inline` folds it into the IRAM loop. */
+/* number of bits to represent n (encoder's calc_bits). Uses unsigned and a
+ * hard cap of 31 so a large/garbage magnitude can't spin forever (1<<31 wraps
+ * on ARM and made the naive loop never terminate).
+ * Hot path: called per-coefficient in the mantissa plane. The old while-loop
+ * counted up to 31 times; Xtensa LX6 has a 1-cycle count-leading-zeros (NSAU),
+ * exposed as __builtin_clz, so compute the bit width directly. Bit-identical to
+ * the loop: calc_bits(u) = (u==0)?0 : floor(log2(u))+1, capped at 31. `inline`
+ * so it folds into the IRAM mantissa loop instead of being a flash call. */
 static inline int lhdc_dec_calc_bits(int n)
 {
     unsigned u = (n < 0) ? (unsigned)(-(long)n) : (unsigned)n;
@@ -436,10 +444,9 @@ static inline int lhdc_dec_calc_bits(int n)
  *   M[k]  = (coeff[k] << shift[k]) | mantissa,  shift[k] from causal IIR predictor
  *   sign  = 1 extra bit when M != 0
  * `start_bit` is the plane start (relative to the channel byte slice). Returns the
- * peak |M| so the caller can select the correct plane offset: the range coder
- * leaves a data-dependent 2- or 3-byte lookahead gap, and a wrong start desyncs
- * the predictor and inflates |M|, so the smaller peak indicates the right offset.
- * pred_mode = flag2.
+ * peak |M| so the caller can pick the correct plane offset (the range coder leaves
+ * a data-dependent 2- or 3-byte lookahead gap; the wrong start desyncs the predictor
+ * and explodes |M|, so min-peak reliably selects the right offset). pred_mode = flag2.
  */
 static LHDC_HOT int64_t lhdc_dec_mant_plane(const int32_t *coeff, int32_t *out, int cnt,
                                    const uint8_t *pl, int total_bits,
@@ -447,21 +454,22 @@ static LHDC_HOT int64_t lhdc_dec_mant_plane(const int32_t *coeff, int32_t *out, 
 {
     int p = start_bit;
     /* The mantissa shift predictor is seeded by the transmitted initial shift
-     * (the 4-bit "resid" field), not 0. shift[0] = (pred+0x40)>>7, and the first
-     * iteration leaves pred unchanged, so seeding pred = init_shift<<7 yields
-     * shift[0] = init_shift = calc_bits(|M[0]|). Without this, frames whose first
-     * coefficient has a large magnitude and a zero Rice quotient lose all
-     * mantissa bits, desyncing the spectrum. */
+     * (the 4-bit "resid" field), NOT 0. shift[0] = (pred+0x40)>>7, and the
+     * first iteration leaves pred unchanged ((a+b)*pred>>3 == pred), so seeding
+     * pred = init_shift<<7 yields shift[0] = init_shift = calc_bits(|M[0]|).
+     * Without this, dense frames whose first coeff has a large magnitude (and a
+     * zero Rice quotient) lose all mantissa bits -> spectrum desync/garble. */
     int pred = init_shift << 7;
     int64_t peak = 0;
     for (int k = 0; k < cnt; k++) {
         int s = (pred + 0x40) >> 7;
-        /* Read s mantissa bits MSB-first. When the 4 bytes are in bounds (the
-         * common mid-buffer case) they are batched into a single shifted 4-byte
-         * load: the field occupies bits (31-off)..(32-off-s), so (w<<off)>>(32-s)
-         * right-aligns it. The guard (byte+4)*8<=total_bits ensures all 32 bits
-         * are valid and s<=24 keeps off+s<=31. Boundary/large-s cases use the
-         * per-bit fallback. */
+        /* Read s mantissa bits MSB-first. The ARM-style per-bit loop did s byte
+         * loads + shifts; on Xtensa we batch them into ONE shifted 4-byte load
+         * when the 4 bytes are in-bounds (the common mid-buffer case): the field
+         * is w bits (31-off)..(32-off-s), so (w<<off)>>(32-s) right-aligns it.
+         * Guard (byte+4)*8<=total_bits ensures all 32 bits are valid (no
+         * zero-fill) and s<=24 keeps off+s<=31. Bit-identical to the loop
+         * (verified 2,000,000 random cases). Boundary/large-s -> per-bit fallback. */
         int mant;
         {
             int byte = p >> 3, off = p & 7;
@@ -492,7 +500,7 @@ static LHDC_HOT int64_t lhdc_dec_mant_plane(const int32_t *coeff, int32_t *out, 
         { int64_t a = mag < 0 ? -(int64_t)mag : mag; if (a > peak) peak = a; }
         int x = lhdc_dec_calc_bits(mag) << 7;
 #if defined(LHDC_HOST_BUILD)
-        { extern volatile int g_lhdc_trace; if (g_lhdc_trace > 0 && k < 240)
+        { extern volatile int g_lhdc_trace; if (g_lhdc_trace > 0 && k < 24)
             printf("[MANT] k=%d coeff=%d s=%d mant=%d mag=%d pred=%d p=%d\n", k, (int)coeff[k], s, mant, mag, pred, p); }
 #endif
         pred = pred_mode ? ((7 * pred + x) >> 3) : ((5 * x + 3 * pred) >> 3);
@@ -502,15 +510,14 @@ static LHDC_HOT int64_t lhdc_dec_mant_plane(const int32_t *coeff, int32_t *out, 
 
 /*
  * Decode a single channel.
- *
- * force_sel: -1 = auto (descramble selector = header byte[8]&1, saving the
- * original header bytes for a possible retry); 0/1 = retry with this forced
- * selector (restoring the saved header bytes first). The byte[8]&1 selector is
- * wrong on a minority of frames, which desyncs that channel's FAC into a huge
- * |M|. The caller re-runs the channel with the flipped selector when the decode
- * goes out of range and keeps the in-range result. g_lhdc_chan_maxM exposes this
- * channel's peak |M| for that check.
  */
+/* force_sel: -1 = auto (descramble selector = header byte[8]&1, save original
+ * header bytes for a possible retry); 0/1 = retry with this forced selector
+ * (restores the saved original header bytes first). The byte[8]&1 selector source
+ * is reverse-engineered and is wrong on a minority of frames, desyncing that
+ * channel's FAC into huge |M| (the 900k dense-channel garble). The caller re-runs
+ * the channel with the flipped selector when the decode explodes and keeps the
+ * in-range result. g_lhdc_chan_maxM exposes this channel's peak |M| for that check. */
 int64_t g_lhdc_chan_maxM = 0;
 float g_lhdc_chan_specmax = 0;   /* peak of post-SNS spectrum; desync detector */
 static lhdc_dec_ret_t lhdc_dec_decode_channel(lhdc_decoder_t *dec,
@@ -530,12 +537,13 @@ static lhdc_dec_ret_t lhdc_dec_decode_channel(lhdc_decoder_t *dec,
     int64_t t_ent0 = 0, t_ent1 = 0, t_im0 = 0, t_im1 = 0;
 
     /*
-     * Each channel occupies a fixed, equal slice of the payload:
-     * ch_bytes = frame_bytes / channels. The encoder writes two independent
-     * byte-aligned channel buffers of frame_bytes/channels each. Channel
-     * `channel` starts at ch_start = channel*ch_bytes. The bit reader is
-     * positioned there and the channel's mantissa plane is confined to its own
-     * slice (pl = payload+ch_start). */
+     * Each channel occupies a FIXED, equal slice of the payload:
+     * ch_bytes = frame_bytes / channels (the encoder writes two independent
+     * byte-aligned channel buffers of frame_bytes/channels each — verified:
+     * 125+125 for a 250-byte 2ch frame). Channel `channel` starts at
+     * ch_start = channel*ch_bytes. Position the bit reader there and confine the
+     * channel's mantissa plane to its own slice (pl = payload+ch_start). This
+     * replaces the old (wrong) "decode ch0, probe for ch1 byte boundary" logic. */
     int n_ch = (hdr->channels < 1) ? 1 : hdr->channels;
     int ch0_bytes = enc_frame_len / n_ch;
     int ch_start = channel * ch0_bytes;
@@ -545,9 +553,9 @@ static lhdc_dec_ret_t lhdc_dec_decode_channel(lhdc_decoder_t *dec,
     if (channel == 1) { const char *e = getenv("LHDC_CH1_START");
         if (e) { ch_start = atoi(e); ch_bytes = enc_frame_len - ch_start; } }
 #endif
-    /* Each channel's 8-byte header is scrambled independently. parse_header only
-     * copies the payload, so every channel descrambles its own header here, which
-     * lets the caller retry the selector. */
+    /* Each channel's 8-byte header is scrambled independently. parse_header now
+     * only COPIES the payload (no descramble), so every channel descrambles its
+     * own header here — uniformly, which lets the caller retry the selector. */
     {
         static uint8_t s_hdr_save[8];
         static int s_saved_start = -1;
@@ -563,14 +571,14 @@ static lhdc_dec_ret_t lhdc_dec_decode_channel(lhdc_decoder_t *dec,
     lhdc_bit_reader_init(br, dec->payload_buf + ch_start, (size_t)ch_bytes);
 
     /*
-     * Per-channel leading section:
+     * Per-channel leading section (PROJECT_CONTEXT §7, validated):
      *   [1] flag (==0)
      *   [9] global gain index
      *   [4] sns_mode-8
-     *   [num_sfb-1] SNS direction bits   <- consumed inside lhdc_sns_decode_params
-     *   [nzc_bits] (nzc>>1)-1            <- nzc_bits = calc_bits(samples)-1
+     *   [num_sfb-1] SNS dir bits     <- consumed inside lhdc_sns_decode_params
+     *   [7] (nzc>>1)-1               <- ECB[0x18] = calc_bits(samples)-1 = 7
      *   [1] flag2
-     *   [4] residual field               <- present when frame_len >= 320
+     *   [4] residual field           <- ECB[0x1c] = 4 if frame_len>=160 else 0
      * then the FAC spectral stream.
      */
     int flag = (int)lhdc_bit_reader_read(br, 1);
@@ -611,10 +619,15 @@ static lhdc_dec_ret_t lhdc_dec_decode_channel(lhdc_decoder_t *dec,
     dec->sns_params.nzc = nzc;
 
     /* flag2 selects the mantissa bit-allocation predictor: 0 = fast IIR
-     * A[k]=(5*x+3*A[k-1])>>3, 1 = slow IIR B[k]=(7*B[k-1]+x)>>3. */
+     * A[k]=(5*x+3*A[k-1])>>3, 1 = slow IIR B[k]=(7*B[k-1]+x)>>3. (Verified:
+     * flag2 == the encoder's predictor-selection field for 500/1k/2k/5k/10k Hz.) */
     int pred_mode = (int)lhdc_bit_reader_read(br, 1);   /* flag2 */
-    /* The residual field is a 4-bit value read between flag2 and the FAC stream,
-     * present only for larger frames. The threshold is enc_frame_len >= 320. */
+    /* resid_bits = ECB[0x1c], read 4 bits between flag2 and the FAC stream.
+     * GROUND TRUTH (bcfg_probe over all 24 configs, ecb+0x1c): resid=4 for
+     *   44.1k br6,7,8 (enc_frame_len 326,612,680), 48k/96k br7,8 (562,624);
+     *   resid=0 for everything <=312 (48k/96k br6, 44.1k br5).
+     * The break is between 312 (resid=0) and 326 (resid=4), so threshold 320.
+     * The old >=400 wrongly gave resid=0 for 44.1k br6 (326), desyncing it. */
     int resid_bits = (enc_frame_len >= 320) ? 4 : 0;
 #if defined(LHDC_HOST_BUILD)
     { const char *e = getenv("LHDC_RESID"); if (e) resid_bits = atoi(e); }
@@ -660,13 +673,22 @@ static lhdc_dec_ret_t lhdc_dec_decode_channel(lhdc_decoder_t *dec,
     }
 #endif
     /*
-     * Rice split = num_coeffs/3 (240->80, 480->160, 960->320), constant across
-     * bitrate and bit depth. It sets pivot = max(count-split, 0); coefficients
-     * beyond `pivot` switch to LSB-plane coding.
+     * Rice split = bandcfg[0x20], which the encoder passes to RiceQuotientEncode
+     * (verified at the call site BitsPredictCompressEval@0xd4878: split is loaded
+     * from *(ECB+0x848)+0x20, the band-config struct, NOT ECB[0x20]). Dumping it
+     * across configs gives split = spf/3 = num_coeffs/3 (240->80, 480->160,
+     * 960->320), constant across bitrate and bit depth. It sets pivot =
+     * max(count-split,0); coeffs beyond `pivot` switch to LSB-plane coding. The
+     * old hardcoded split=0 (pivot=count) only matched frames with no |coeff|>=2
+     * past index num_coeffs/3*2, so it passed the low-energy 24-config test but
+     * misdecodes real high-frequency content into noise.
      */
     int split = num_coeffs / 3;
-    /* FAC moving-average windows come from the band config (57/63 @48k,
-     * 96/64 @96k); these are what the decoder's range model needs. */
+    /* FAC moving-average windows = band_cfg[0x28]/[0x2c] (57/63 @48k, 96/64 @96k).
+     * NOTE: the ecb[0x28] "win1" (80/125/281 per bitrate, == frame_header&0x3FF on
+     * the synthetic tone probe) is a DIFFERENT encoder parameter and is NOT the
+     * decoder's FAC model window — using it (enc_frame_len/2) desynced every rate
+     * (billions). The band_cfg constant is what the decoder's range model needs. */
     int ma_win1 = band_cfg->ma_win1;
     int ma_win2 = band_cfg->ma_win2;
     (void)lhdc_dec_ma_window;
@@ -687,7 +709,7 @@ static lhdc_dec_ret_t lhdc_dec_decode_channel(lhdc_decoder_t *dec,
                                           ma_win1, ma_win2, &fac_bytes,
                                           dec->fac_buf, (int)sizeof(dec->fac_buf),
                                           dec->ent_s1,
-                                          dec->ent_s2, dec->alloc_mdct_size);  /* ent_s2 capacity = num_coeffs*2 */
+                                          dec->ent_s2, dec->alloc_mdct_size);  /* ent_s2 cap = num_coeffs*2 */
     t_ent1 = LHDC_NOW_US();
     if (ret != LHDC_DEC_OK) {
         return ret;
@@ -713,24 +735,25 @@ static lhdc_dec_ret_t lhdc_dec_decode_channel(lhdc_decoder_t *dec,
 
     /*
      * Mantissa + sign plane (immediately after the FAC byte stream at
-     * fac_start + fac_bytes*8). The FAC stream carried only q[k] = the high bits
-     * of each quantized coefficient. The full magnitude is reconstructed
-     * sequentially:
+     * fac_start + fac_bytes*8). The FAC stream only carried q[k] = the HIGH bits
+     * of each quantized coeff. The full magnitude is reconstructed sequentially:
      *
-     *   shift[k] = calc_bits(|M[k-1]|)            (running context; M[-1]=0)
+     *   shift[k] = calc_bits(|M[k-1]|)         (running context; M[-1]=0)
      *   M[k]     = (q[k] << shift[k]) | mantissa  (mantissa = shift[k] raw bits)
      *   if M[k] != 0: read 1 sign bit (1 = negative)
      *
-     * The encoder writes shift[k] mantissa bits then a sign bit (when M[k]!=0),
-     * MSB-first. Without this, the residual at high-energy bins (where q is
-     * shifted to 0 and the magnitude lives entirely in the mantissa) is lost.
+     * This is the encoder's per-coeff bit-plane (LhdcEncode @0xd1e80): it writes
+     * shift[k] mantissa bits then a sign bit (when M[k]!=0), MSB-first. Without
+     * this the residual at high-energy bins (e.g. a tone band, where q is shifted
+     * to 0 but the magnitude lives entirely in the mantissa) is lost.
      */
     {
         /* The range coder leaves a data-dependent lookahead gap before the mantissa
-         * plane: 2 or 3 bytes (16 or 24 bits), keyed on the final range, and it may
-         * differ per channel. Decode the plane for both candidate starts and keep
-         * the one with the smaller peak |M|: a wrong start desyncs the causal shift
-         * predictor and inflates |M| by orders of magnitude. */
+         * plane: 2 or 3 bytes (16 or 24 bits, per lhdc_dec_arith_stop, keyed on the
+         * final range). Each channel may differ. Decode the plane for BOTH candidate
+         * starts and keep the one with the smaller peak |M|: the wrong start desyncs
+         * the causal shift predictor and explodes |M| by orders of magnitude, so this
+         * selects the correct offset per channel. */
         const uint8_t *pl = dec->payload_buf + ch_start;   /* this channel's byte slice */
         int total_bits = ch_bytes * 8;
         int32_t *qs = dec->quant_spectrum;
@@ -739,9 +762,11 @@ static lhdc_dec_ret_t lhdc_dec_decode_channel(lhdc_decoder_t *dec,
         for (int k = 0; k < cnt; k++) coeff[k] = qs[k];
 
         int forced = -1, sel = 1;   /* sel: 0=min-peak, 1=range-rule (default) */
-        /* All rates use the exact range-rule mantissa-gap selection. With the
-         * correct FAC model windows the range coder stays in sync, so the rule
-         * applies directly and the min-peak heuristic is not needed. */
+        /* All rates use the exact range-rule mantissa-gap selection (the same
+         * path that decodes 48k bit-clean). The earlier huge-|M| desyncs at 96k
+         * were the wrong FAC model window (114/126); with the correct 96/64 the
+         * range coder stays in sync, so the exact rule applies and the 3-pass
+         * min-peak heuristic (extra CPU + occasional mispick) is unneeded. */
 #if defined(LHDC_HOST_BUILD)
         { const char *e = getenv("LHDC_MANT_DELTA"); if (e) forced = atoi(e); }
         { const char *e = getenv(channel == 0 ? "LHDC_D0" : "LHDC_D1"); if (e) forced = atoi(e); }
@@ -776,17 +801,18 @@ static lhdc_dec_ret_t lhdc_dec_decode_channel(lhdc_decoder_t *dec,
             int fr = fac_bytes - best_delta; if (fr < 0) fr = 0;
             int64_t pk = lhdc_dec_mant_plane(coeff, qs, cnt, pl, total_bits,
                                              fac_start_bit + fr * 8, pred_mode, resid_val);
-            /* The 2-vs-3-byte gap can be mispicked on dense/high-bitrate frames;
-             * a wrong start desyncs the shift predictor and pushes |M| past 24-bit
-             * full scale. A correctly decoded frame cannot exceed full scale, so
-             * if it does, retry the other gap and keep whichever stays in range.
-             * Only the bad frames pay the extra pass. */
+            /* The 2-vs-3-byte arith-stop gap can be mispicked on dense/high-bitrate
+             * frames; the wrong start desyncs the shift predictor and |M| overshoots
+             * 24-bit full scale by 2-11x (heard as the loud-pop/conceal garble at
+             * 900 kbps). A correctly decoded frame can't exceed full scale, so if it
+             * does, retry the OTHER gap and keep whichever stays in range. Only the
+             * (~10% at high bitrate) bad frames pay the extra pass. */
             if (forced < 0 && pk > 8388607) {
                 int other = (best_delta == 2) ? 3 : 2;
                 int fr2 = fac_bytes - other; if (fr2 < 0) fr2 = 0;
                 int64_t pk2 = lhdc_dec_mant_plane(coeff, qs, cnt, pl, total_bits,
                                                   fac_start_bit + fr2 * 8, pred_mode, resid_val);
-                if (pk2 >= pk) {   /* other gap no better -> restore the range-rule result */
+                if (pk2 >= pk) {   /* other no better -> restore the range-rule result */
                     (void)lhdc_dec_mant_plane(coeff, qs, cnt, pl, total_bits,
                                               fac_start_bit + fr * 8, pred_mode, resid_val);
                 } else {
@@ -822,35 +848,32 @@ static lhdc_dec_ret_t lhdc_dec_decode_channel(lhdc_decoder_t *dec,
 #endif
 
     /*
-     * Coefficient de-reversal. The encoder quantizes the spectrum in reversed
-     * bin order: its quant loop reads the whitened spectrum backward from bin
-     * (nzc-1) down to 0 while writing the coeff array forward, so transmitted
-     * coeff[j] = quantize(spectrum[nzc-1-j]). The decoder must reverse the first
-     * nzc decoded coefficients back to natural bin order before dequant + SNS,
-     * otherwise a low-frequency tone lands at a high bin. Bins [nzc..num_coeffs)
-     * stay 0.
+     * Coefficient de-reversal. The encoder quantizes the spectrum in REVERSED
+     * bin order: its quant loop (LhdcEncode @0xd1b48) reads the whitened
+     * spectrum backward from bin (nzc-1) down to 0 while writing the coeff
+     * array forward, so transmitted coeff[j] = quantize(spectrum[nzc-1-j]).
+     * The decoder must reverse the first nzc decoded coeffs back to natural bin
+     * order before dequant + SNS, otherwise a low-frequency tone lands at a high
+     * bin (the long-standing "1kHz -> noise" bug). Bins [nzc..num_coeffs) stay 0.
      */
     {
         int32_t *qs = dec->quant_spectrum;
-        /* The decoded coefficients occupy qs[0..nzc-1], which is the encoder's
-         * significant region in reversed order, so bin s comes from qs[nzc-1-s].
-         * Reverse the first nzc entries in place; the dropped top spectrum lines
-         * [nzc..num_coeffs) stay 0. */
+        /* The decoded coeffs occupy qs[0..nzc-1] = M[nc-nzc+k] = the encoder's
+         * significant M region, which is the spectrum REVERSED. So bin s comes
+         * from qs[nzc-1-s]. Reverse the first nzc entries in place; bins
+         * [nzc..num_coeffs) (the dropped top spectrum lines) stay 0. Verified:
+         * decoder M == encoder M bit-exact, and this puts a 1kHz tone at bin 9. */
         int rn = nzc; if (rn > num_coeffs) rn = num_coeffs;
         for (int a = 0, b = rn - 1; a < b; a++, b--) {
             int32_t t = qs[a]; qs[a] = qs[b]; qs[b] = t;
         }
     }
 
-    /* Inverse quantization: linear dequant by 2^e(global_gain). The level table's
-     * `size` parameter is the encoder's per-channel encoded byte count
-     * (enc_pixel_size_byte), i.e. the frame payload divided by the channel count,
-     * NOT the whole frame payload. */
+    /* Inverse quantization: linear dequant by 2^e(global_gain) (§11). */
     int bit_depth = (int)dec->config.bit_depth;
-    int level_size = enc_frame_len / n_ch;
     lhdc_dec_inverse_quantize(dec->quant_spectrum,
                                dec->mdct_in, num_coeffs,
-                               &dec->sns_params, level_size, bit_depth,
+                               &dec->sns_params, (enc_frame_len / n_ch), bit_depth,
                                dec->config.sample_rate);
     if (g_lhdc_trace > 0) {
         int qmax = 0; float qsum = 0.0f; float dmax = 0;
@@ -912,8 +935,9 @@ static lhdc_dec_ret_t lhdc_dec_decode_channel(lhdc_decoder_t *dec,
     }
 
 #if defined(LHDC_HOST_BUILD)
-    /* Host diagnostic: append the IMDCT input (post-SNS spectrum) for ch0 to a
-     * binary file for offline analysis. */
+    /* Host diagnostic: append the exact IMDCT input (post-SNS spectrum) for ch0
+     * to a binary file so an offline tool can run a known-clean IMDCT+OLA and
+     * localize the frame-rate AM (spectrum vs synthesis). */
     if (channel == 0) {
         const char *sp = getenv("LHDC_DUMP_SPEC");
         if (sp) {
@@ -923,8 +947,8 @@ static lhdc_dec_ret_t lhdc_dec_decode_channel(lhdc_decoder_t *dec,
     }
 #endif
 #if defined(LHDC_HOST_BUILD)
-    /* Print the peak magnitude at each decode stage (entropy / dequant / SNS) to
-     * locate where an out-of-range frame originates. */
+    /* STAGE-MAX localization: print the peak magnitude at each decode stage so a
+     * garble frame's explosion can be pinned to entropy / dequant / SNS. */
     if (getenv("LHDC_STAGEMAX")) {
         int qmax = 0; for (int k = 0; k < num_coeffs; k++) { int q = dec->quant_spectrum[k]; if (q<0) q=-q; if (q>qmax) qmax=q; }
         float smax = 0.0f; for (int k = 0; k < num_coeffs; k++) { float a = dec->mdct_in[k]; if (a<0) a=-a; if (a>smax) smax=a; }
@@ -965,9 +989,9 @@ static lhdc_dec_ret_t lhdc_dec_decode_channel(lhdc_decoder_t *dec,
     }
 #endif
 
-    /* Steady-state stage profile. Disabled by default: the periodic log output
-     * blocks the decode task on the UART and disturbs the audio. Set
-     * LHDCV5_DEC_PROFILE to 1 for bring-up only. */
+    /* Steady-state stage profile. Disabled: the periodic ESP_LOGI blocks the
+     * decode task for ~9 ms on the 115200-baud UART, which audibly stutters the
+     * audio. Re-enable by setting LHDCV5_DEC_PROFILE to 1 for bring-up only. */
 #if LHDCV5_DEC_PROFILE
     if (g_lhdc_trace == 0) {
         static int64_t a_chan = 0, a_ent = 0, a_im = 0;
@@ -991,12 +1015,16 @@ static lhdc_dec_ret_t lhdc_dec_decode_channel(lhdc_decoder_t *dec,
 }
 
 /* Decode a channel, auto-correcting the descramble selector. The byte[8]&1
- * selector is correct for most frames but wrong for a minority, desyncing that
- * channel's FAC into a huge spectrum. Decode with the auto selector; if the
- * result is in range, keep it, otherwise re-decode with the flipped selector and
- * keep whichever is valid with the smaller peak. Only bad frames pay the extra
- * pass. decode_channel mutates overlap_buf via overlap-add, so the prior-frame
- * overlap is snapshotted and restored before each re-decode. */
+ * selector is right for most frames but wrong for a minority, desyncing that
+ * channel's FAC into a huge spectrum (the 900k dense-channel garble / stutter).
+ * Detection uses g_lhdc_chan_specmax — the peak of the post-SNS spectrum, which
+ * is computed BEFORE the IMDCT/overlap-add and so is independent of the overlap
+ * history (a post-overlap time peak is context-dependent and makes the selector
+ * decision cascade across frames). Decode with the auto selector; if the spectrum
+ * is in range keep it, else re-decode with the flipped selector and keep whichever
+ * is valid with the smaller spectral peak. Only bad frames pay the extra pass.
+ * decode_channel mutates overlap_buf via overlap-add, so the prior-frame overlap
+ * is snapshotted and restored before each re-decode. */
 /* Peak |sample| of a decoded channel (post overlap-add) in the internal scale. */
 static float lhdc_chan_peak(const float *pcm, int n)
 {
@@ -1008,10 +1036,10 @@ static float lhdc_chan_peak(const float *pcm, int n)
 static lhdc_dec_ret_t lhdc_dec_decode_channel_autosel(lhdc_decoder_t *dec,
                                                        int channel, float *pcm_out)
 {
-    /* Desync detector: the same condition the frame conceal uses, per channel:
-     * |pcm|*sc > 2*clip_lim  ->  |pcm| > 2*clip_lim/sc, measured after overlap-add.
-     * The overlap is restored before each retry so the decision uses the true
-     * prior-frame context. */
+    /* Desync detector = the same condition the frame conceal uses, per channel:
+     * |pcm|*sc > 2*clip_lim  ->  |pcm| > 2*clip_lim/sc. Measured AFTER overlap-add
+     * (matches what the listener hears). The overlap is restored before each retry
+     * so the decision uses the true prior-frame context (no cascade). */
     int bd = (int)dec->config.bit_depth;
     float sc = ldexpf(1.0f, bd - 23) * lhdc_dec_rate_norm(dec->band_cfg ? dec->band_cfg->mdct_size : 480)
              * lhdc_dec_level_cal(dec->header.sample_rate, bd);
@@ -1024,7 +1052,8 @@ static lhdc_dec_ret_t lhdc_dec_decode_channel_autosel(lhdc_decoder_t *dec,
     int auto_sel = (ch_start + 8 < (int)sizeof(dec->payload_buf))
                  ? (dec->payload_buf[ch_start + 8] & 1) : 0;
 
-    /* Snapshot the prior-frame overlap into the rate-sized ov_save buffer.
+    /* Snapshot the prior-frame overlap (was a 3.8 KB .bss; now the rate-sized
+     * ov_save buffer carved from the workspace, so it frees with the decoder).
      * overlap_buf holds H = alloc_mdct_size/2 floats; cap to that. */
     int ov_n = samples;
     int ov_cap = dec->alloc_mdct_size / 2;
@@ -1067,9 +1096,11 @@ static size_t lhdc_dec_tail_bytes(int mdct_size)
     b += (size_t)LHDC_DEC_MAX_CHANNELS * (size_t)H * sizeof(float); /* overlap_buf */
     b += (size_t)H * sizeof(float);                       /* pcm_mid */
     b += (size_t)H * sizeof(float);                       /* ov_save (clip-recovery snapshot) */
-    /* Entropy scratch sized to the actual bounds: ent_s1 is indexed only up to
-     * num_coeffs (= mdct_size/2 = H), one per coefficient; ent_s2 (Rice pass-2
-     * ternary) is filled only up to min(count*2, cap) <= num_coeffs*2 = M. */
+    /* Entropy scratch sized to the ACTUAL bounds (was mdct_size / 3*mdct_size/2,
+     * ~2x oversized): ent_s1 is indexed only up to num_coeffs (= mdct_size/2 = H)
+     * one-per-coeff; ent_s2 (Rice pass-2 ternary) is filled only up to
+     * min(count*2, cap) <= num_coeffs*2 = mdct_size = M. Verified vs the decoder's
+     * actual indexing (s1[i<count<=num_coeffs], s2 lazy_cap=count*2). */
     b += (size_t)H;                                       /* ent_s1 (num_coeffs) */
     b += (size_t)M;                                       /* ent_s2 (num_coeffs*2) */
     return b;
@@ -1137,15 +1168,17 @@ lhdc_decoder_t *lhdc_dec_init(void *workspace, const lhdc_dec_config_t *config)
     {
         int M = lhdc_dec_mdct_size(dec->config.sample_rate, dec->config.frame_duration);
         lhdc_dec_carve(dec, (uint8_t *)workspace + sizeof(lhdc_decoder_t), M);
-        /* Build this rate's IMDCT tables now and free the fast tables of any other
-         * rate, so the larger tables do not linger on the heap after a downswitch
-         * (e.g. 96k -> 48k). */
+        /* Build this rate's IMDCT tables now and, crucially, FREE the 96k
+         * (N=960) fast tables (~15 KB) when this rate is not 96k. Otherwise they
+         * linger on the heap after a 96k->48k switch (transform() only inits when
+         * the fast path isn't built yet, so it never frees them on downswitch). */
         lhdc_imdct_init(M);
     }
 
-    /* Allocate the FAC entropy models at config time, while the heap still has a
-     * large contiguous block. Allocating them lazily on the first decode can fail
-     * at 96k, where Bluetooth streaming has already fragmented the heap. */
+    /* Allocate the FAC entropy models NOW (config time), while the heap still has
+     * a large contiguous block. Allocating them lazily on the first decode failed
+     * at 96k -- by then BT streaming fragments the heap to a ~4 KB largest block
+     * and the ~6 KB request fails -> every frame errored -> no audio. */
     lhdc_entropy_alloc();
 
     dec->initialized = 1;
@@ -1176,9 +1209,9 @@ lhdc_dec_ret_t lhdc_dec_decode_frame(
     *generated = 0;
 
     /*
-     * Parse the [u16 LE][payload] frame header. On success the bit reader is
-     * positioned at the start of the payload and frame_consumed = header +
-     * payload bytes.
+     * Parse the [u16 LE][payload] frame header and descramble the payload
+     * (§5/§6). On success the bit reader is positioned at the start of the
+     * descrambled payload and frame_consumed = header + payload bytes.
      */
     size_t frame_consumed = 0;
     lhdc_dec_ret_t ret = lhdc_dec_parse_header(dec, in_data, in_bytes,
@@ -1209,20 +1242,24 @@ lhdc_dec_ret_t lhdc_dec_decode_frame(
     /* Window is produced on demand from the shared static cache (overlap-add). */
     (void)lhdc_dec_get_window(mdct_size);
 
-    /* Output container width. The decode/gain math runs at the real source bit
-     * depth (dec->header.bit_depth), but a 24-bit source is emitted in a 32-bit
-     * int container (interleaved L/R) rather than 3-byte packed. This is
-     * audio-neutral and gives a power-of-2 sample stride end-to-end, simplifying
-     * the I2S/pipeline path. 16-bit is left as-is. */
+    /* Decode each channel */
+    /* Output container width. The decode/gain math still runs at the real source
+     * bit depth (dec->header.bit_depth), but a 24-bit source is EMITTED in a
+     * 32-bit int container (4-byte, interleaved L/R) instead of 3-byte packed,
+     * matching what LDAC/aptX-HD emit. This is audio-neutral (the pipeline's
+     * 24-bit path just <<8's to the same int32), but gives a power-of-2 sample
+     * stride end-to-end, removing the only 3-byte-aligned step in the real-time
+     * I2S/pipeline path. 16-bit is left as-is. */
     int out_bit_depth = ((int)dec->header.bit_depth == 24) ? 32 : (int)dec->header.bit_depth;
     int bytes_per_sample = out_bit_depth / 8;
     float *ch_pcm = dec->ch_pcm;   /* shared per-channel scratch (aliases mdct_in) */
 
     /*
-     * Stereo. LHDC V5 transmits the two channels as direct L/R (ch0 = L,
-     * ch1 = R), not mid/side. ch0's PCM is saved to pcm_mid before ch1 reuses
-     * the shared ch_pcm scratch. Each channel's 8-byte header is descrambled
-     * separately (see lhdc_descramble_inplace in decode_channel). Mono emits ch0.
+     * STEREO. LHDC V5 transmits the two channels as DIRECT L/R (ch0 = L,
+     * ch1 = R) — verified: encoding L=1kHz/R=2kHz decodes ch0->1kHz, ch1->2kHz.
+     * (NOT mid/side.) ch0's PCM is saved to pcm_mid before ch1 reuses the shared
+     * w.ch_pcm scratch. Each channel's 8-byte header is descrambled separately
+     * (see lhdc_descramble_inplace in decode_channel). Mono just emits ch0.
      */
     ret = lhdc_dec_decode_channel_autosel(dec, 0, ch_pcm);
     if (ret != LHDC_DEC_OK) {
@@ -1231,7 +1268,7 @@ lhdc_dec_ret_t lhdc_dec_decode_frame(
     int do_stereo = (channels >= 2);
     if (do_stereo) {
         for (int n = 0; n < samples_per_ch; n++) dec->pcm_mid[n] = ch_pcm[n];
-        ret = lhdc_dec_decode_channel_autosel(dec, 1, ch_pcm);   /* ch_pcm = right channel */
+        ret = lhdc_dec_decode_channel_autosel(dec, 1, ch_pcm);   /* ch_pcm = side */
         if (ret != LHDC_DEC_OK) {
             /* Fall back to mono (mid to both) if ch1 fails. */
             for (int n = 0; n < samples_per_ch; n++) ch_pcm[n] = 0.0f;
@@ -1250,11 +1287,12 @@ lhdc_dec_ret_t lhdc_dec_decode_frame(
     /*
      * Decode-garbage concealment. A correctly decoded frame can never exceed the
      * source's full-scale range, so a peak well past it (>2x) means this frame's
-     * entropy/mantissa decode desynced and produced bogus coefficients (the
-     * mantissa shift M=q<<s amplifies a desync into very large values). Such
-     * frames are concealed with silence and the overlap is reset so the glitch
-     * cannot smear into the next frame; a 5 ms mute is far less audible than the
-     * resulting pop. */
+     * entropy/mantissa decode desynced and produced huge bogus coefficients
+     * (heard as a loud pop/beep, ~3% of frames on busy passages — the mantissa
+     * shift M=q<<s amplifies a desync into tens of millions). Conceal such frames
+     * with silence and reset the overlap so the glitch can't smear into the next
+     * frame. A 5ms mute is far less audible than the beep. (Proper fix = the
+     * upstream entropy desync; tracked separately.) */
     float frame_peak = 0.0f;
     int clip_cnt = 0;
     for (int n = 0; n < samples_per_ch; n++) {
@@ -1281,8 +1319,9 @@ lhdc_dec_ret_t lhdc_dec_decode_frame(
     }
 #endif
     if (conceal) {
-        /* Zero the full overlap buffers (H = alloc_mdct_size/2 floats each) so no
-         * stale overlap leaks into the next frame after a concealed error. */
+        /* Zero the FULL overlap buffers (H = alloc_mdct_size/2 floats each), not
+         * sizeof(float*) — the latter only cleared 8 bytes, leaving stale overlap
+         * to leak into the next frame on a concealed error. */
         size_t ov_bytes = (size_t)(dec->alloc_mdct_size / 2) * sizeof(float);
         memset(dec->overlap_buf[0], 0, ov_bytes);
         if (channels >= 2) memset(dec->overlap_buf[1], 0, ov_bytes);
@@ -1306,15 +1345,24 @@ lhdc_dec_ret_t lhdc_dec_decode_frame(
             if (channels >= 2) o[n * channels + 1] = (int16_t)rv;
         } else if (bytes_per_sample == 3) {
             /*
-             * 24-bit PCM output for ESP32 I2S/DMA, written as interleaved 32-bit
-             * slots (int32 L, int32 R, ...) rather than 3-byte packed samples,
-             * which matches the common ESP32 I2S configuration that carries
-             * 24-bit audio in 32-bit slots. The 24 valid bits are left-justified
-             * by default (sample << 8); define LHDC_DEC_24BIT_I2S_RIGHT_JUSTIFIED
-             * to keep them right-justified in the low 24 bits instead.
+             * 24-bit PCM output for ESP32 I2S/DMA.
              *
-             * Caller note: output bytes = samples_per_ch * channels *
-             * sizeof(int32_t), not * 3.
+             * Old behavior packed samples as 3 bytes:
+             *   L0 L1 L2 R0 R1 R2 ...
+             * That is valid packed PCM, but it is wrong for the common ESP32
+             * I2S configuration that uses 24-bit audio in 32-bit slots. Feeding
+             * 3-byte packed audio to a 32-bit-slot DMA stream shifts the channel
+             * framing and can sound like low-frequency leakage / motorboating.
+             *
+             * New behavior writes interleaved 32-bit slots:
+             *   int32 L, int32 R, int32 L, int32 R ...
+             * The 24 valid bits are left-justified by default: sample << 8.
+             * Use LHDC_DEC_24BIT_I2S_RIGHT_JUSTIFIED=1 if your I2S path expects
+             * right-justified 24-bit values in the low 24 bits instead.
+             *
+             * IMPORTANT for caller:
+             *   output bytes = samples_per_ch * channels * sizeof(int32_t)
+             * not samples_per_ch * channels * 3.
              */
             LHDC_OUT_SAMPLE(lv, l, -8388608.0f, 8388607.0f);
             LHDC_OUT_SAMPLE(rv, r, -8388608.0f, 8388607.0f);
@@ -1350,7 +1398,7 @@ lhdc_dec_ret_t lhdc_dec_decode_frame(
         }
     }
 
-    /* Report bytes consumed (u16 LE header + payload) and samples generated. */
+    /* Update output ([u16 LE] header + payload bytes consumed). */
     *consumed = frame_consumed;
     *generated = (uint32_t)samples_per_ch;
     dec->frame_index++;
@@ -1383,9 +1431,10 @@ void lhdc_dec_flush(lhdc_decoder_t *dec)
 {
     if (!dec) return;
 
-    /* Clear the full overlap buffers (H = alloc_mdct_size/2 floats each) so stale
-     * overlap from a previous stream cannot leak into the first frame after a
-     * flush/reset (codec switch / track start) and cause a cold-start click. */
+    /* Clear the FULL overlap buffers (H = alloc_mdct_size/2 floats each), not
+     * sizeof(float*) — the latter cleared only 4-8 bytes, leaving stale overlap
+     * from a previous stream to leak into the first frame after a flush/reset
+     * (codec switch / track start) -> a cold-start click. */
     size_t ov_bytes = (size_t)(dec->alloc_mdct_size / 2) * sizeof(float);
     if (ov_bytes == 0) ov_bytes = (size_t)(LHDC_DEC_MAX_MDCT_SIZE / 2) * sizeof(float);
     for (int ch = 0; ch < LHDC_DEC_MAX_CHANNELS; ch++) {
