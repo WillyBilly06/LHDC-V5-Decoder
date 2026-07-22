@@ -71,6 +71,15 @@ static int lhdc_cos_table_ensure(int N)
     return 0;
 }
 
+/* Release the reference-IMDCT cosine table (heap, ~30 KB at large N). Optional;
+ * call at teardown so it doesn't linger in DRAM after LHDC stops. */
+void lhdc_imdct_free_cos(void)
+{
+    if (s_cos_tab) { free(s_cos_tab); s_cos_tab = NULL; }
+    s_cos_tab_n = 0;
+    s_cos_period = 0;
+}
+
 static void lhdc_imdct_ref(const float *in, float *out, int mdct_size)
 {
     int N = mdct_size;
