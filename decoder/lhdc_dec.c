@@ -236,88 +236,84 @@ static lhdc_dec_ret_t lhdc_dec_parse_header(lhdc_decoder_t *dec,
  * spectrum by q[k] = round(spectrum[k] * 2^-e(gidx)); the decoder dequantizes
  * linearly: spectrum[k] = q[k] * 2^e(gidx).
  *
- * e(idx) is piecewise in the 512-entry gain table:
- *   idx <= split        : e = idx
- *   split < idx <= 503  : e = split + (idx-split)*slope
- *   idx > 503           : e = e(503) + (idx-504), clamped to 30
- * (split, slope) depend on frame length; for 48k/16-bit:
- *   split = (int)(((L-50)*(-0.017144) + 26.18) / 2.5)
- *   slope = (e_full - split) / (503 - split)   with e_full ~ 30
+ * Ported bit-exactly from the reference decoder's level table (Android lhdcv5
+ * Rust, src/common/lhdc_level.rs `LevelTable::init`/`calc`). The gain table is a
+ * piecewise-linear curve of gain_idx:
+ *   offset_max = a - (a-c)/575 * (L-50)   (a,c depend on bit depth AND rate)
+ *   start      = trunc(offset_max / D)     (D = 4 for 24-bit, 2.5 for 16-bit)
+ *   jump       = (offset_max - start) / (503 - start)   [503 = OFFSET_MAX-1]
+ *   e(idx):  idx <= start           : idx
+ *            start < idx <= 504      : start + (idx-start)*jump
+ *            idx > 504               : start + (504-start)*jump + (idx-504)
+ *            (clamped to 30)         [OFFSET_MAX = 504]
+ *
+ * The per-rate (a,c): 24-bit 44.1/48k (26.2,16.4); 96k (25.7,20.75);
+ * 192k (25.7,24.42). 16-bit 44.1k (26.15,16.42); 48k (26.18,16.32).
+ *
+ * NOTE: an earlier port used the 48k constants for every rate and force-set
+ * slope=0.0378, which happened to track the *phone* encoder's gain approximately
+ * but is wrong for the true 96k/192k curves -- with a correct encoder the 192k
+ * dequant scale is badly off. This exact per-rate table is required.
  */
-static float lhdc_dec_gain_exponent(int gain_idx, int enc_frame_len, int bit_depth)
+static float lhdc_dec_gain_exponent(int gain_idx, int enc_frame_len, int bit_depth,
+                                    uint32_t sample_rate)
 {
     int L = enc_frame_len;
 #if defined(LHDC_HOST_BUILD)
     { const char *ld = getenv("LHDC_LDIV"); if (ld) { int d = atoi(ld); if (d > 0) L = enc_frame_len / d; } }
 #endif
-    /* The split index is computed differently per bit depth: 16-bit divides by
-     * 2.5 with constants -0.017144/26.18; 24-bit divides by 4 with constants
-     * -0.01705/26.20. The slope and the idx>503 tail have the same shape. */
-    int split;
+    const int OFFSET_MAX = 504;   /* (1<<9) - 8 */
+    float xf = (float)(L - 50);
+    float divisor;
+    float offset_max = 30.0f;      /* reference default when no rate case matches */
     if (bit_depth == 24) {
-        split = (int)(((L - 50) * (-0.01705f) + 26.20f) * 0.25f + 0.5f);   /* /4 -> *0.25 (exact) */
+        divisor = 4.0f;
+        if (sample_rate == 96000)       offset_max = 25.7f - (25.7f - 20.75f) / 575.0f * xf;
+        else if (sample_rate == 192000) offset_max = 25.7f - (25.7f - 24.42f) / 575.0f * xf;
+        else if (sample_rate <= 48000)  offset_max = 26.2f - (26.2f  - 16.4f)  / 575.0f * xf; /* <=48k */
+        /* else: 30.0 default */
     } else {
-        /* Kept as /2.5f, not *0.4f: 0.4f is not exactly representable, and this
-         * feeds an integer `split` that must match the encoder bit-for-bit;
-         * a 1-ULP shift could flip it. Runs once per channel. */
-        split = (int)(((L - 50) * (-0.017144f) + 26.18f) / 2.5f + 0.5f);  /* round */
+        divisor = 2.5f;
+        if (sample_rate == 48000)       offset_max = 26.18f - (26.18f - 16.32f) / 575.0f * xf;
+        else if (sample_rate <= 44100)  offset_max = 26.15f - (26.15f - 16.42f) / 575.0f * xf; /* <=44.1k */
+        /* else (96k/192k 16-bit): 30.0 default */
     }
-    if (split < 1) split = 1;
-    if (split > 30) split = 30;
-    /* 24-bit: cap split at 5. The formula over-produces split for small (low
-     * bitrate) frames, which shifts the whole dequant scale and makes those
-     * frames decode too loud. Capping at 5 keeps the level consistent across
-     * bitrates; the higher bitrates already produce split <= 5 and are
-     * unchanged. */
-    if (bit_depth == 24 && split > 5) split = 5;
+    int start = (int)(offset_max / divisor);          /* trunc toward zero */
 #if defined(LHDC_HOST_BUILD)
-    { const char *sp = getenv("LHDC_SPLIT"); if (sp) split = atoi(sp);
-      const char *c2 = getenv("LHDC_SPLITC2"); if (c2 && bit_depth == 24) {
-          split = (int)(((L - 50) * (-0.01705f) + (float)atof(c2)) * 0.25f + 0.5f);
-          if (split < 1) split = 1; if (split > 30) split = 30; } }
+    { const char *sp = getenv("LHDC_SPLIT"); if (sp) start = atoi(sp); }
 #endif
-    /* slope = (e_full - split)/(503 - split) with e_full ~= 24.9. */
-    float e_full = 24.9f;
+    int deno = OFFSET_MAX - start - 1;                 /* = 503 - start */
+    float jump = (deno != 0) ? (offset_max - (float)start) / (float)deno : 0.0f;
 #if defined(LHDC_HOST_BUILD)
-    { const char *ef = getenv("LHDC_EFULL"); if (ef) e_full = (float)atof(ef); }
-#endif
-    float slope = (503 > split) ? (e_full - split) / (503 - split) : 0.0f;
-
-    /* 24-bit: the sloped-region gain step is a near-constant ~0.0378 per index,
-     * not the (e_full-split)/(503-split) curve. That curve over-slopes as `split`
-     * shrinks at high bitrate, so the per-frame dequant scale becomes wrong when
-     * the encoder's global_gain swings frame-to-frame. The resulting mis-scale
-     * breaks MDCT TDAC cancellation and leaves an amplitude-modulation comb at
-     * the frame rate. The constant slope avoids this across all 24-bit rates. */
-    if (bit_depth == 24) slope = 0.0378f;
-#if defined(LHDC_HOST_BUILD)
-    { const char *sl = getenv("LHDC_SLOPE"); if (sl) slope = (float)atof(sl); }
+    { const char *sl = getenv("LHDC_SLOPE"); if (sl) jump = (float)atof(sl); }
 #endif
 
     float e;
-    if (gain_idx <= split) {
+    if (gain_idx <= start) {
         e = (float)gain_idx;
-    } else if (gain_idx <= 503) {
-        e = split + (gain_idx - split) * slope;
     } else {
-        float e503 = split + (503 - split) * slope;
-        e = e503 + (gain_idx - 504);
+        int lo = (gain_idx < OFFSET_MAX) ? gain_idx : OFFSET_MAX;
+        int hi = (gain_idx > OFFSET_MAX) ? gain_idx : OFFSET_MAX;
+        e = (float)(lo - start) * jump + (float)start + (float)(hi - OFFSET_MAX);
         if (e > 30.0f) e = 30.0f;
     }
     return e;
 }
 
-/* Per-rate output level normalization. 44.1k/48k (mdct_size 480) decode at unity,
- * but the reconstruction gain falls ~1/N^2 with the transform size N, so without
- * correction the higher rates are progressively quieter. (mdct_size/480)^2
- * (480->x1, 960->x4, 1920->x16) restores a consistent level across rates. */
+/* Per-rate output level normalization. 44.1k/48k (mdct_size 480) decode at unity;
+ * the reconstruction level falls ~1/N with the transform size N, so (mdct_size/480)
+ * (480->x1, 960->x2, 1920->x4) restores a consistent, value-preserving level across
+ * rates. NOTE: this is linear in N, not N^2. The previous (N/480)^2 over-amplified
+ * the higher rates -- it was compensating the OLD (too-low) 96k/192k dequant gain;
+ * with the exact per-rate gain table it drives 96k to full scale and 192k into
+ * hard clipping. Linear rate_norm + the exact gain keeps every rate value-preserving. */
 static float lhdc_dec_rate_norm(int mdct_size)
 {
     float r = (float)mdct_size / 480.0f;
 #if defined(LHDC_HOST_BUILD)
     { const char *e = getenv("LHDC_RATEPOW"); if (e) return powf(r, (float)atof(e)); }
 #endif
-    return r * r;
+    return r;
 }
 
 /* Per-config output level calibration toward value-preserving output (0 dBFS in
@@ -353,12 +349,13 @@ static float lhdc_dec_level_cal(uint32_t sample_rate, int bit_depth)
 static LHDC_HOT void lhdc_dec_inverse_quantize(int32_t *quant, float *spectrum,
                                        int num_coeffs,
                                        const lhdc_dec_sns_params_t *sns,
-                                       int enc_frame_len, int bit_depth)
+                                       int enc_frame_len, int bit_depth,
+                                       uint32_t sample_rate)
 {
     /* step = 2^e with FRACTIONAL e -> exp2f (single precision), NOT ldexpf
      * (which would truncate the fractional exponent and shift the level). */
     float step = exp2f(lhdc_dec_gain_exponent(
-                           sns->global_gain, enc_frame_len, bit_depth));
+                           sns->global_gain, enc_frame_len, bit_depth, sample_rate));
     for (int k = 0; k < num_coeffs; k++) {
         spectrum[k] = (float)quant[k] * step;
     }
@@ -487,7 +484,7 @@ static LHDC_HOT int64_t lhdc_dec_mant_plane(const int32_t *coeff, int32_t *out, 
         { int64_t a = mag < 0 ? -(int64_t)mag : mag; if (a > peak) peak = a; }
         int x = lhdc_dec_calc_bits(mag) << 7;
 #if defined(LHDC_HOST_BUILD)
-        { extern volatile int g_lhdc_trace; if (g_lhdc_trace > 0 && k < 24)
+        { extern volatile int g_lhdc_trace; if (g_lhdc_trace > 0 && k < 240)
             printf("[MANT] k=%d coeff=%d s=%d mant=%d mag=%d pred=%d p=%d\n", k, (int)coeff[k], s, mant, mag, pred, p); }
 #endif
         pred = pred_mode ? ((7 * pred + x) >> 3) : ((5 * x + 3 * pred) >> 3);
@@ -837,11 +834,16 @@ static lhdc_dec_ret_t lhdc_dec_decode_channel(lhdc_decoder_t *dec,
         }
     }
 
-    /* Inverse quantization: linear dequant by 2^e(global_gain). */
+    /* Inverse quantization: linear dequant by 2^e(global_gain). The level table's
+     * `size` parameter is the encoder's per-channel encoded byte count
+     * (enc_pixel_size_byte), i.e. the frame payload divided by the channel count,
+     * NOT the whole frame payload. */
     int bit_depth = (int)dec->config.bit_depth;
+    int level_size = enc_frame_len / n_ch;
     lhdc_dec_inverse_quantize(dec->quant_spectrum,
                                dec->mdct_in, num_coeffs,
-                               &dec->sns_params, enc_frame_len, bit_depth);
+                               &dec->sns_params, level_size, bit_depth,
+                               dec->config.sample_rate);
     if (g_lhdc_trace > 0) {
         int qmax = 0; float qsum = 0.0f; float dmax = 0;
         for (int k = 0; k < num_coeffs; k++) {
@@ -860,7 +862,7 @@ static lhdc_dec_ret_t lhdc_dec_decode_channel(lhdc_decoder_t *dec,
         }
         ESP_LOGI("LHDCV5_DEC", "ch%d dequant: gain=%d e=%.2f qmean=%.3f specmax=%.1f peakbin=%d | q[8..12]=%d %d %d %d %d",
                  channel, (int)dec->sns_params.global_gain,
-                 lhdc_dec_gain_exponent(dec->sns_params.global_gain, enc_frame_len, bit_depth),
+                 lhdc_dec_gain_exponent(dec->sns_params.global_gain, enc_frame_len, bit_depth, dec->config.sample_rate),
                  qsum / num_coeffs, dmax, pk,
                  (int)dec->quant_spectrum[8], (int)dec->quant_spectrum[9],
                  (int)dec->quant_spectrum[10], (int)dec->quant_spectrum[11],
