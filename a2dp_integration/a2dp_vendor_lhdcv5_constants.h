@@ -3,7 +3,8 @@
 
 /* Android BluetoothCodecType.CODEC_ID_LHDCV5 = 0x0000004c35053aff.
  * A2DP vendor codec info carries the company ID and vendor codec ID after the
- * NON_A2DP media codec type byte, giving company 0x053a and codec 0x4c35.
+ * NON_A2DP media codec type byte, so that maps to company 0x053a and codec
+ * 0x4c35.
  */
 #define A2DP_LHDCV5_VENDOR_ID 0x0000053a
 #define A2DP_LHDCV5_CODEC_ID  0x4c35
@@ -53,7 +54,7 @@
 
 #define A2DP_LHDCV5_FEATURE_LLESS_RAW 0x80
 
-/* Backward-compatible aliases used by the decoder wrapper. */
+/* Backward-compatible aliases for the experimental decoder wrapper. */
 #define A2DP_LHDCV5_BITS_PER_SAMPLE_32 A2DP_LHDCV5_BIT_FMT_32
 #define A2DP_LHDCV5_BITS_PER_SAMPLE_24 A2DP_LHDCV5_BIT_FMT_24
 #define A2DP_LHDCV5_BITS_PER_SAMPLE_16 A2DP_LHDCV5_BIT_FMT_16
