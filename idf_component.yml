@@ -1,0 +1,17 @@
+version: "1.0.0"
+description: >-
+  LHDC V5 software decoder for ESP-IDF. Decodes Bluetooth LHDC hi-res audio
+  (44.1 / 48 / 96 / 192 kHz, 16- and 24-bit) to interleaved PCM in real time.
+  Portable C with no external dependencies; runs on the classic dual-core ESP32.
+  Includes reference Bluedroid A2DP-sink integration glue and a host round-trip
+  test harness.
+url: "https://github.com/WillyBilly06/LHDC-V5-Decoder"
+repository: "https://github.com/WillyBilly06/LHDC-V5-Decoder.git"
+issues: "https://github.com/WillyBilly06/LHDC-V5-Decoder/issues"
+tags:
+  - bluetooth
+  - a2dp
+  - audio
+  - codec
+  - lhdc
+  - decoder
