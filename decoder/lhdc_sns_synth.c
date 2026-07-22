@@ -98,42 +98,78 @@ static int sns_floordiv(int32_t a, int32_t b)
     return (int)q;
 }
 
+/* div_euclid for a positive divisor (floors toward -inf), matching Rust's
+ * i32::div_euclid used by the reference encoder's div_round. */
+static inline int32_t sns_div_euclid_pos(int32_t a, int32_t b)
+{
+    int32_t q = a / b, r = a % b;
+    if (r < 0) q -= 1;   /* b > 0 */
+    return q;
+}
+/* div_round(x, 4) = (x + 2).div_euclid(4)  (reference math::div_round). */
+static inline int32_t sns_div_round4(int32_t x)
+{
+    return sns_div_euclid_pos(x + 2, 4);
+}
+/* div::<3>(x) = (x * floor(2^31/3)) >> 31  (reference math::div, N=3). This is
+ * (x-1)/3 for positive x and (x-2)/3 for negative x, NOT ordinary /3. */
+static inline int32_t sns_div3(int32_t x)
+{
+    return (int32_t)(((int64_t)x * 715827882) >> 31);
+}
+
 /*
- * SNS envelope post-processing: mean removal, a 4-tap sliding average, negation,
- * then clamping to [-2560, 1024]. This must be applied to the adsq reconstruction
- * before using sf as the SNS envelope; otherwise sf carries a large DC offset and
- * the wrong shape, leaving the spectrum whitened.
+ * SNS envelope reconstruction. Ported bit-exactly from the reference LHDC-V5
+ * encoder (Android lhdcv5 Rust, src/enc/process.rs `lhdc_enc_freq_shift`,
+ * lines 521-538 + `moving_average`). `sf` on entry is the DPCM/adsq
+ * reconstruction (== the encoder's post-`jump_adust` `se`, with sf[0]=0, which
+ * our lhdc_sns_adsq_inverse already reproduces bit-exactly). This routine
+ * reproduces exactly what the encoder applies to the spectrum:
+ *   1. mean-remove: se[0] = -(sum(se[1..n]) * num_inv >> 31);  se[i] += se[0]
+ *      (num_inv = segment_num_inv = round(2^31/n): 67108864 for 32, 89478485 for 24)
+ *   2. asymmetric WINDOW=4 moving average (window is one below + two above; the
+ *      leftmost keeps itself, the last two use widths 3 and 1)
+ *   3. clamp to [-2560, 1024], THEN negate (this order matters)
+ *
+ * The previous implementation used a symmetric 4-tap [1/4,1/4,1/4,1/4] average,
+ * a rounded mean, and negate-before-clamp -- an approximation that mis-shaped
+ * the low-frequency SNS envelope and distorted between-bin sub-bass at 96k/192k.
  */
 static void sns_post_smooth(int32_t *sf, int n)
 {
-    int32_t total = 0;
-    for (int i = 0; i < n; i++) total += sf[i];
-    int mean = sns_floordiv(total + (total >= 0 ? (n >> 1) : -(n >> 1)), n);
+    (void)sns_floordiv;
+    if (n < 4) return;   /* real configs use 24 or 32 segments */
+    int64_t num_inv = (n == 24) ? 89478485 : 67108864;   /* round(2^31 / n) */
 
-    int32_t s[LHDC_DEC_MAX_SFB];
+    /* 1. mean-remove (exact). sf[0] is 0 on entry. */
+    int32_t sum = 0;
+    for (int i = 1; i < n; i++) sum += sf[i];
+    int32_t s0 = (int32_t)(((int64_t)(-sum) * num_inv) >> 31);
+    sf[0] = s0;
+    for (int i = 1; i < n; i++) sf[i] += s0;
+
+    /* 2. asymmetric WINDOW=4 moving average -> out. */
     int32_t out[LHDC_DEC_MAX_SFB];
-    for (int i = 0; i < n; i++) { s[i] = sf[i] - mean; out[i] = s[i]; }
+    out[0] = sf[0];
+    int32_t total = sf[0] + sf[1] + sf[2] + sf[3];
+    out[1] = sns_div_round4(total);
+    int i = 2;
+    while (i < n - 2) {
+        total += sf[i + 2] - sf[i - 2];
+        out[i] = sns_div_round4(total);
+        i++;
+    }
+    total -= sf[i - 2];
+    out[i] = sns_div3(total);
+    i++;
+    out[i] = sf[i - 1];   /* = sf[n-2] */
 
-    if (n >= 2) {
-        int acc = s[0] + s[1] + (n > 2 ? s[2] : 0) + (n > 3 ? s[3] : 0);
-        out[1] = (acc + 2) >> 2;
-    }
-    if (n >= 5) {
-        int acc = s[0] + s[1] + s[2] + s[3];
-        for (int i = 0; i < n - 3; i++) {
-            acc = acc - s[i] + ((i + 4 < n) ? s[i + 4] : 0);
-            if (i + 2 < n) out[i + 2] = (acc + 2) >> 2;
-        }
-    }
-    /*
-     * Negate the smoothed envelope, then clamp to [-2560, 1024]. The clamp must
-     * follow the negation.
-     */
-    for (int i = 0; i < n; i++) {
-        int v = -out[i];
+    /* 3. clamp [-2560, 1024], THEN negate. */
+    for (int k = 0; k < n; k++) {
+        int32_t v = out[k];
         if (v < -2560) v = -2560;
         if (v > 1024) v = 1024;
-        sf[i] = v;
+        sf[k] = -v;
     }
 }
 

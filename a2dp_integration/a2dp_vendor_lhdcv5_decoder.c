@@ -17,35 +17,37 @@
 #if (defined(LHDCV5_DEC_INCLUDED) && LHDCV5_DEC_INCLUDED == TRUE)
 
 /* Bluedroid's LOG_INFO/APPL_TRACE_* are compiled out (CONFIG_BT_STACK_NO_LOG),
- * so use ESP-IDF logging directly for the decode path. */
+ * so use ESP-IDF logging directly to verify the decode path on the monitor. */
 #define LHDCV5_TAG "LHDCV5_DEC"
 #define LHDCV5_LOGI(...) ESP_LOGI(LHDCV5_TAG, __VA_ARGS__)
 #define LHDCV5_LOGW(...) ESP_LOGW(LHDCV5_TAG, __VA_ARGS__)
 #define LHDCV5_LOGE(...) ESP_LOGE(LHDCV5_TAG, __VA_ARGS__)
 
-/* Per-packet decode logging. Disabled by default: each ESP_LOGI blocks the
- * decode task long enough on the UART to stutter playback. Enable only for
- * bring-up. */
+/* Per-packet decode logging. OFF: each ~100-char ESP_LOGI blocks the decode
+ * task ~9 ms on the 115200-baud UART and audibly stutters playback. Set to 1
+ * only for bring-up. */
 #define LHDCV5_VERBOSE 0
-/* Dump a few over-the-air payloads as hex for offline analysis. */
+/* Dump a few real over-the-air payloads as hex (for host replay/sweep). */
 #define LHDCV5_FRAMEDUMP 0
 static uint32_t s_dump_sr = 0;
 static uint32_t s_fd_count = 0;   /* reset per stream in configure */
 
-/* LHDC frames are small (a 96k/5ms frame is under ~1.3 KB); even a fragmented
- * frame fits in 3 KB. */
+/* LHDC frames are small (a 96k/5ms HR frame is <~1.3 KB); even a fragmented
+ * frame fits in 3 KB. 8 KB was wasteful static .bss that starved the heap. */
 #define LHDCV5_FRAGMENT_BUF_SIZE (3 * 1024)
 /* Decode output buffer. Must match BT_A2DP_SINK_BUF_LHDCV5 in btc_a2dp_sink.c.
- * Sized so 24-bit content emitted in 32-bit containers fits up to 192k
+ * 4 KB so 24-bit content emitted in 32-bit containers fits up to 192k
  * (960*2*4 = 7680 B). */
 #define LHDCV5_MAX_PCM_BYTES     (4 * 2000)
 
 /*
- * The decoder workspace is allocated from the main internal heap via
- * heap_caps_malloc(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT) rather than osi_malloc.
- * The bluedroid/osi heap fragments during a call so a large allocation there can
- * fail; the main internal heap keeps a large contiguous region. Allocated once
- * at init, reused across reconfigurations, freed on cleanup.
+ * The decoder workspace (~39 KB) is allocated from the MAIN internal heap via
+ * heap_caps_malloc(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT), NOT osi_malloc. The
+ * bluedroid/osi heap fragments down to a ~15 KB largest free block during a
+ * call, so osi_malloc(39 KB) fails there ("cannot allocate" -> NULL decoder ->
+ * silent packet drop). The main internal heap keeps a large contiguous region.
+ * Allocated ONCE at init, reused across reconfigurations, freed on cleanup. A
+ * permanent static .bss array would instead starve the runtime heap.
  */
 #define LHDCV5_WS_CAPS (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
 typedef struct {
@@ -58,9 +60,9 @@ typedef struct {
     decoded_data_callback_t decode_callback;
 } tA2DP_LHDCV5_DECODER_CB;
 
-/* Allocated lazily on init, freed on cleanup. The control block embeds the
+/* Allocated lazily on init, freed on cleanup. The control block embeds a 3 KB
  * fragment-reassembly buffer; keeping it off .bss frees that RAM whenever LHDC
- * is not the active codec (only one A2DP codec runs at a time). The decoder
+ * is not the active codec (only one A2DP codec runs at a time). The big decoder
  * workspace (cb->workspace) is separately rate-sized in decoder_configure. */
 static tA2DP_LHDCV5_DECODER_CB *s_lhdc_cb = NULL;
 
@@ -73,23 +75,26 @@ bool a2dp_lhdcv5_decoder_init(decoded_data_callback_t decode_callback) {
         }
     }
     tA2DP_LHDCV5_DECODER_CB *cb = s_lhdc_cb;
-    void  *ws  = cb->workspace;      /* preserve any already-allocated block across re-init */
+    void  *ws  = cb->workspace;      /* keep an already-allocated block across re-init */
     size_t wss = cb->workspace_size;
     memset(cb, 0, sizeof(*cb));
     cb->decode_callback = decode_callback;
-    /* Workspace is rate-sized and (re)allocated in decoder_configure once the
-     * negotiated sample rate is known. Any existing block is kept here. */
+    /* Workspace is RATE-SIZED, so it is (re)allocated in decoder_configure once
+     * the negotiated sample rate is known. Keep any existing block here. */
     cb->workspace = ws;
     cb->workspace_size = wss;
     return true;
 }
 
 void a2dp_lhdcv5_decoder_cleanup(void) {
-    /* Release the lazily-allocated fast-IMDCT tables and entropy FAC models as
-     * LHDC is going away, so none of the decoder's scratch lingers in DRAM while
-     * another codec is active. */
+    /* Release the lazily-allocated fast-IMDCT tables (480 ~4.2 KB, 960 ~15 KB)
+     * and the entropy FAC models (~6 KB) since LHDC is going away — so none of
+     * the decoder's scratch lingers in DRAM while LDAC/SBC is the active codec. */
     lhdc_imdct_free_960();
     lhdc_imdct_free_480();
+    lhdc_imdct_free_1920();   /* 192k tables (missed before -> leaked at 192 kHz) */
+    lhdc_imdct_free_cos();    /* reference-IMDCT cosine table (~30 KB, was never freed) */
+    lhdc_dec_free_window();   /* KBD window (was only freed on rate change) */
     lhdc_entropy_free();
     tA2DP_LHDCV5_DECODER_CB *cb = s_lhdc_cb;
     if (!cb) return;
@@ -109,12 +114,12 @@ void a2dp_lhdcv5_decoder_configure(const uint8_t* p_codec_info) {
         return;
     }
 
-    cb->decoder = NULL;   /* re-initialized below */
+    cb->decoder = NULL;   /* re-init below */
 
     lhdc_dec_config_t config = {
         .sample_rate = LHDC_DEC_SR_48000,
         .bit_depth = LHDC_DEC_BITDEPTH_16,
-        .frame_duration = LHDC_DEC_FRAME_5MS,   /* LHDC V5 uses 5 ms frames */
+        .frame_duration = LHDC_DEC_FRAME_5MS,   /* LHDC V5 encoder uses 5ms */
         .channels = 2,
         .max_frame_bytes = LHDCV5_FRAGMENT_BUF_SIZE,
         .lossless_enable = 0,
@@ -140,15 +145,19 @@ void a2dp_lhdcv5_decoder_configure(const uint8_t* p_codec_info) {
 
     config.channels = 2;
 
-    /* Grow-only workspace, sized for the largest rate (192k, mdct 1920) on the
-     * first LHDC config and then reused for every rate with no reallocation.
+    /* GROW-ONLY workspace, MAX-SIZED for 192k (mdct 1920 = 32,544 B) on the FIRST
+     * LHDC config, then REUSED for every rate with zero realloc.
      *
-     * Allocating the maximum size up front, while the heap is still
-     * unfragmented, guarantees the 192k workspace fits and keeps the heap stable
-     * across LHDC rate switches. A rate-sized grow-only scheme would fail when a
-     * mid-stream 48k->192k switch needs to grow the block after streaming has
-     * fragmented the heap. The block is freed when the active codec leaves
-     * LHDC. */
+     * Why: rate-sized grow-only can't get 192k to allocate -- the phone connects
+     * 48k first (10 KB ws), then the 48k->192k switch must grow to 32.5 KB, but
+     * streaming has fragmented the heap (largest hole seen as low as 18 KB) so the
+     * 32.5 KB malloc fails -> dec=NULL -> no 192k. Grabbing the full 32.5 KB on the
+     * first config (heap still pristine, ~70+ KB largest) and never realloc'ing
+     * GUARANTEES 192k fits AND keeps the heap stable across LHDC rate switches.
+     * The earlier max-size attempt was reverted ONLY because it had no headroom
+     * (starved 48k/96k to near-OOM); it is now paired with RAM reclaim (lazy/
+     * smaller overlay-mixer ring + smaller audio jitter ring, ~12 KB) so 48k/96k
+     * keep workable free heap. The block frees when the active codec leaves LHDC. */
     {
         size_t need = lhdc_dec_get_workspace_size(LHDC_DEC_SR_192000, config.frame_duration);
         if (!cb->workspace || cb->workspace_size < need) {
@@ -162,7 +171,7 @@ void a2dp_lhdcv5_decoder_configure(const uint8_t* p_codec_info) {
                 return;
             }
             cb->workspace_size = need;
-            LHDCV5_LOGI("configure: workspace %u bytes (sized for 192k; rate=%u)",
+            LHDCV5_LOGI("configure: workspace %u bytes (max-sized for 192k; rate=%u)",
                         (unsigned)need, (unsigned)config.sample_rate);
         }
     }
@@ -171,7 +180,7 @@ void a2dp_lhdcv5_decoder_configure(const uint8_t* p_codec_info) {
     cb->fragment_size = 0;
     cb->fragment_count = 0;
 #if LHDCV5_FRAMEDUMP
-    s_dump_sr = config.sample_rate; s_fd_count = 0;   /* reset capture per stream */
+    s_dump_sr = config.sample_rate; s_fd_count = 0;   /* fresh capture per stream */
 #endif
 
     if (!cb->decoder) {
@@ -182,7 +191,7 @@ void a2dp_lhdcv5_decoder_configure(const uint8_t* p_codec_info) {
     LHDCV5_LOGI("decoder configured: sr=%d depth=%d ch=%d dur=%d",
                 (int)config.sample_rate, (int)config.bit_depth,
                 (int)config.channels, (int)config.frame_duration);
-    g_lhdc_trace = 0;   /* verbose per-frame decode trace off */
+    g_lhdc_trace = 0;   /* verbose per-frame decode trace off (was 6 for bring-up) */
 }
 
 ssize_t a2dp_lhdcv5_decoder_decode_packet_header(BT_HDR* p_buf) {
@@ -202,7 +211,7 @@ ssize_t a2dp_lhdcv5_decoder_decode_packet_header(BT_HDR* p_buf) {
         (struct media_payload_header*)(src + sizeof(struct media_packet_header));
 
 #if LHDCV5_VERBOSE
-    /* Periodic confirmation that A2DP media packets reach the LHDC decoder. */
+    /* Periodic proof that A2DP media packets are reaching the LHDC decoder. */
     static uint32_t s_hdrs = 0;
     if ((s_hdrs++ % 200) == 0) {
         LHDCV5_LOGI("pkt hdr#%u: len=%u frag=%d first=%d last=%d frame_count=%u",
@@ -225,12 +234,15 @@ ssize_t a2dp_lhdcv5_decoder_decode_packet_header(BT_HDR* p_buf) {
         cb->fragment_count = payload->frame_count;
     } else {
         /* Non-fragmented packet: decode_packet parses the self-delimiting LHDC
-         * frame stream directly (looping on each frame's [u16 len] header and
-         * not using frame_count), so any count is acceptable here, including 0.
-         * The LHDC payload's leading byte is a seq/marker byte rather than a
-         * frame counter, so this field is not meaningful. If a payload has no
-         * decodable frame, decode_packet returns false (frames==0) and the
-         * packet is dropped there. */
+         * frame stream directly (it loops on each frame's [u16 len] header and
+         * does NOT use frame_count), so any count is fine -- do NOT reject 0.
+         * The LHDC payload's leading byte is a seq/marker byte, not an SBC frame
+         * counter, so this 4-bit field is meaningless here. At 256 kbps the phone
+         * packs several small frames per packet and the field reads 0; the old
+         * `frame_count==0 -> EINVAL` rejected EVERY such packet -> NO AUDIO at
+         * 256k (higher bitrates happened to read non-zero and slipped through).
+         * If a payload truly has no decodable frame, decode_packet returns false
+         * (frames==0) and the packet is dropped there. */
         cb->fragment_count = 0;
         cb->fragment_size = 0;
     }
@@ -270,11 +282,12 @@ bool a2dp_lhdcv5_decoder_decode_packet(BT_HDR* p_buf, unsigned char* buf,
     size_t src_size = p_buf->len;
 
 #if LHDCV5_FRAMEDUMP
-    /* Dump a burst of over-the-air payloads as hex for offline analysis, tagged
-     * FDUMP. Captures one consecutive run per stream, past startup. */
+    /* Capture a few REAL over-the-air payloads as hex so the exact frames the
+     * phone sends can be replayed/swept on host. Dumps packets 40..47 (past
+     * startup) once per stream, tagged FDUMP for easy grep. */
     {
         uint32_t i = s_fd_count++;
-        if (i >= 60 && i < 140) {   /* one consecutive burst (80 frames) */
+        if (i >= 60 && i < 140) {   /* one long consecutive burst (80 frames) */
             char line[1600]; int p = 0;
             p += snprintf(line+p, sizeof(line)-p, "FDUMP#%u len=%u sr=%u:", i,
                           (unsigned)src_size, (unsigned)s_dump_sr);
@@ -306,14 +319,21 @@ bool a2dp_lhdcv5_decoder_decode_packet(BT_HDR* p_buf, unsigned char* buf,
 
     /*
      * One A2DP payload is a concatenation of LHDC V5 frames, each
-     * [u16 LE length][payload]. Decode each frame in a loop until the input is
-     * exhausted, emitting its PCM to the sink callback immediately rather than
-     * accumulating (DRAM is scarce). `buf` is the caller-provided PCM scratch,
-     * large enough for one frame (1920 samples).
-     *
-     * The payload begins with a single leading byte (an LHDC seq/marker byte)
-     * before the frame stream; the frames themselves start at offset 1. Skip
-     * that byte.
+     * [u16 LE header][payload]. Decode them in a loop until the input is
+     * exhausted, accumulating the PCM and emitting it to the sink callback.
+     */
+    /*
+     * Decode each LHDC frame in the payload and emit its PCM to the sink right
+     * away (no large accumulation buffer — DRAM on ESP32 is scarce). `buf` is
+     * the caller-provided PCM scratch, big enough for one frame (1920 samples).
+     */
+    /*
+     * The over-the-air LHDC V5 payload begins with ONE leading byte before the
+     * frame stream (an LHDC seq/marker byte not present in the raw encoder
+     * vectors the parser was validated against). The real frames start at
+     * offset 1 as [u16 LE length][payload]; verified on-device by descrambling
+     * each candidate start and checking the leading flag bit == 0 (offset 1, LE
+     * was the unique hit: hdr=0x047d len=250 flag=0). Skip that byte.
      */
     size_t off = (src_size >= 1) ? 1 : 0;
     int frames = 0;
@@ -350,8 +370,9 @@ bool a2dp_lhdcv5_decoder_decode_packet(BT_HDR* p_buf, unsigned char* buf,
     }
 
 #if LHDCV5_VERBOSE
-    /* Periodic stats confirming audio is flowing. Disabled by default: the
-     * ESP_LOGI blocks the decode task long enough to stutter audio. */
+    /* Periodic stats so we can confirm audio is flowing on the serial monitor.
+     * OFF by default: the ESP_LOGI blocks the decode task ~9 ms on the UART and
+     * stutters audio. The decode-time profiling timers live behind this too. */
     {
         static uint32_t s_packets = 0, s_frames = 0, s_pcm = 0;
         s_packets++; s_frames += frames; s_pcm += pcm_emitted;

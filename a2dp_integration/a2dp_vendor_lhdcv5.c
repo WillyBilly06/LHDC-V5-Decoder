@@ -13,12 +13,14 @@
 static const tA2DP_LHDCV5_CIE a2dp_lhdcv5_sink_caps = {
     A2DP_LHDCV5_VENDOR_ID,
     A2DP_LHDCV5_CODEC_ID,
-    /* Advertised sample rates. All four are supported by the decoder; the
-     * workspace is sized for the highest (see decoder_configure). */
+    /* Advertise ONLY 44.1/48 kHz. The decoder workspace is sized for the 48 kHz
+     * (240-spf / MDCT-480) path to keep RAM minimal (~9 KB). Advertising 96/192k
+     * would let the phone negotiate a frame size we can't decode in that budget
+     * (and the 192k frames don't match our validated 48k framing). */
     A2DP_LHDCV5_SAMPLING_FREQ_44100 |
         A2DP_LHDCV5_SAMPLING_FREQ_48000 |
-        A2DP_LHDCV5_SAMPLING_FREQ_96000 |   /* fast IMDCT-960 */
-        A2DP_LHDCV5_SAMPLING_FREQ_192000,   /* fast IMDCT-1920 */
+        A2DP_LHDCV5_SAMPLING_FREQ_96000 |  /* 96k: rate-sized workspace + fast IMDCT-960 */
+        A2DP_LHDCV5_SAMPLING_FREQ_192000,  /* 192k: fast IMDCT-1920; single-core decode (cross-core WIP) */
     A2DP_LHDCV5_BITS_PER_SAMPLE_16 |
         A2DP_LHDCV5_BITS_PER_SAMPLE_24,
     A2DP_LHDCV5_CHANNEL_MODE_STEREO,
@@ -235,9 +237,13 @@ bool A2DP_VendorBuildCodecConfigLhdcV5(uint8_t* p_src_cap, uint8_t* p_result) {
     return false;
   }
 
-  /* Sample-rate preference order: 48k, then 44.1k, then 96k, then 192k. The
-   * higher rates are chosen only when the source offers nothing lighter, so
-   * normal playback stays on the less CPU-intensive paths. */
+  /* Always negotiate 48 kHz (fall back to 44.1k). Our decoder workspace is
+   * sized only for the 240-spf / MDCT-480 path; 96/192k would need a much larger
+   * workspace and don't match our validated framing, so never select them even
+   * if the phone offers them. */
+  /* Prefer 48k, then 44.1k. 96k is a LAST resort (only when the phone offers
+   * nothing else, i.e. the user explicitly selected 96k) so normal playback is
+   * never accidentally pushed to the CPU-heavy 96k path. */
   if (src_cap.sampleRate & A2DP_LHDCV5_SAMPLING_FREQ_48000) {
     pref_cap.sampleRate = A2DP_LHDCV5_SAMPLING_FREQ_48000;
   } else if (src_cap.sampleRate & A2DP_LHDCV5_SAMPLING_FREQ_44100) {
@@ -245,12 +251,14 @@ bool A2DP_VendorBuildCodecConfigLhdcV5(uint8_t* p_src_cap, uint8_t* p_result) {
   } else if (src_cap.sampleRate & A2DP_LHDCV5_SAMPLING_FREQ_96000) {
     pref_cap.sampleRate = A2DP_LHDCV5_SAMPLING_FREQ_96000;
   } else if (src_cap.sampleRate & A2DP_LHDCV5_SAMPLING_FREQ_192000) {
-    /* 192k: chosen only when the source offers nothing lighter. Decodes via the
-     * fast IMDCT-1920 path, which is the heaviest, so it is selected last. */
+    /* 192k: only when the phone offers nothing lighter (i.e. the user explicitly
+     * selected 192k). Decodes via the verified fast IMDCT-1920; real-time on this
+     * ESP32 still needs the cross-core stereo split (WIP) -> expect underrun until
+     * then. Listed last so normal playback is never pushed to the heaviest path. */
     pref_cap.sampleRate = A2DP_LHDCV5_SAMPLING_FREQ_192000;
   } else {
-    /* Source offers only unsupported rates: fail config so the peer falls back
-     * to another codec (LDAC/AAC/SBC) instead of a broken LHDC link. */
+    /* Phone offers only rates we don't support -> fail config; phone picks
+     * another codec (LDAC/AAC/SBC) rather than a broken LHDC link. */
     return false;
   }
 
@@ -260,12 +268,14 @@ bool A2DP_VendorBuildCodecConfigLhdcV5(uint8_t* p_src_cap, uint8_t* p_result) {
     pref_cap.bitsPerSample = A2DP_LHDCV5_BITS_PER_SAMPLE_16;
   }
 
-  /* Echo the source's selected target-bitrate range in the SET_CONFIGURATION
-   * response. The sink decodes whatever frames arrive and advertises the full
-   * 64K..1000K range, so echoing the source's min/max is always valid. Echoing
-   * (rather than keeping the default min=64K / max=1000K) is required because a
-   * mismatch between the requested and responded range causes some sources to
-   * refuse to start the stream. */
+  /* Echo the source's negotiated target-bitrate range. Previously pref_cap kept
+   * the default (min=64K / max=1000K), so the SET_CONFIGURATION response did NOT
+   * match the bitrate the phone requested. When the user fixes a low target
+   * bitrate (256 kbps sets MIN_BIT_RATE=256K=0x80), the phone saw the sink echo
+   * min=64K, treated it as a config mismatch, and refused to start the stream ->
+   * NO AUDIO at 256 kbps (higher fixed rates use a lower min and slipped through).
+   * The sink decodes whatever frames arrive and advertises the full 64K..1000K
+   * range, so echoing the phone's selected min/max is always valid. */
   pref_cap.maxTargetBitrate = src_cap.maxTargetBitrate;
   pref_cap.minTargetBitrate = src_cap.minTargetBitrate;
 

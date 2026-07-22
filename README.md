@@ -382,8 +382,14 @@ Validated by phone-encoder round-trip (real `liblhdcv5.so`) and on-device playba
 - **Bit-exact decode** confirmed on the host round-trip across all configurations,
   including 96 kHz and 192 kHz (decoded spectrum matches the encoder input within lossy
   tolerance, no added leakage).
-- **THD (tone in -> tone out):** 48 kHz 50 Hz / 1 kHz = -70.1 / -80.2 dB;
-  96 kHz 50 Hz / 1 kHz = -60.6 / -80.9 dB.
+- **Scale-factor (SNS) and gain reconstruction are now bit-exact against the reference.**
+  This corrected an earlier low-frequency error that showed up as elevated THD / "watery"
+  distortion on sub-~50 Hz tones and slow bass sweeps at 96/192 kHz, plus a level-scaling
+  bug that clipped 192 kHz. Every sample rate and bit depth now reconstructs down to the
+  codec's clean quantization floor.
+- **THD (tone in -> tone out):** ~-64 dB across 44.1/48/96/192 kHz and both bit depths
+  (uniform at the lossy quantization floor, including the low bass region that used to
+  distort).
 - **IMDCT self-tests** (480 / 960 / 1920) pass against the cosine-formula reference.
 - **On-device (ESP32):** 44.1 / 48 / 96 kHz play clean and glitch-free in real time at all
   bitrates (256 k -> 900 k + Auto).
