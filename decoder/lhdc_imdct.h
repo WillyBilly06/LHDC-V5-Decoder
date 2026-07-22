@@ -39,4 +39,11 @@ void lhdc_imdct_free_480(void);
  */
 void lhdc_imdct_free_1920(void);
 
+/*
+ * Free the lazily-allocated reference-IMDCT cosine table (~30 KB DRAM at large
+ * N). Optional; call at teardown so it doesn't linger after LHDC stops. Safe to
+ * call when nothing is allocated.
+ */
+void lhdc_imdct_free_cos(void);
+
 #endif /* LHDC_IMDCT_H */

@@ -459,7 +459,6 @@ Xtensa LX6-specific optimizations applied:
 
 ## License
 
-Released under the **Apache License 2.0** (see `LICENSE`). This applies to the decoder
-implementation in this repository. It does **not** grant any rights to the LHDC codec
-itself, which is the property of Savitech; obtaining LHDC licensing for your use case is
-your responsibility.
+This decoder implementation is released under the **Apache License 2.0**. Note that this
+does **not** grant any rights to the LHDC codec itself, which is the property of Savitech;
+obtaining LHDC licensing for your use case is your responsibility.
