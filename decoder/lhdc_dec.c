@@ -102,6 +102,14 @@ static const float *lhdc_dec_get_window(int mdct_size)
     }
     return s_imdct_window;
 }
+
+/* Release the KBD analysis window. Call at decoder teardown so it doesn't
+ * linger in DRAM after LHDC stops. */
+void lhdc_dec_free_window(void)
+{
+    if (s_imdct_window) { free(s_imdct_window); s_imdct_window = NULL; s_imdct_window_size = 0; }
+}
+
 /* perm[k] = source byte index that lands at position k after descrambling. */
 static const uint8_t LHDC_PERM[2][8] = {
     { 4, 0, 1, 5, 7, 3, 2, 6 },
