@@ -20,9 +20,10 @@ typedef struct lhdc_band_cfg_desc {
     uint16_t  mdct_size;
     const uint16_t *band_off;
     const uint16_t *band_scale;
-    /* FAC moving-average window sizes. The adaptive model switches from its fill
-     * phase to the sliding-window phase at these counts; wrong windows desync the
-     * range decoder mid-stream. 48k/5ms (spf=240): win1=57, win2=63. */
+    /* FAC moving-average window sizes (band_cfg[0x28]/[0x2c] in the encoder).
+     * Dumped from liblhdcv5.so; the encoder switches its adaptive model from the
+     * fill phase to the sliding-window phase at these counts. Wrong windows
+     * desync the range decoder mid-stream. 48k/5ms (spf=240): win1=57, win2=63. */
     uint16_t  ma_win1;
     uint16_t  ma_win2;
 } lhdc_band_cfg_desc_t;
