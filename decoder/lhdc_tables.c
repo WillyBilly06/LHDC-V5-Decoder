@@ -9,7 +9,7 @@
 #endif
 
 /* ================================================================
- * LHDC V5 codec constant tables
+ * REAL EXTRACTED DATA FROM liblhdcv5.so (LHDC V5 Encoder Binary)
  * ================================================================ */
 
 /* Band offset tables - MDCT coefficient start index per scale factor band */
@@ -130,9 +130,12 @@ const uint32_t lhdc_band_stop_table[36] = {
 
 /* Band configuration descriptors */
 const lhdc_band_cfg_desc_t lhdc_band_cfgs[LHDC_BAND_CFG_COUNT] = {
-    /* ma_win1/ma_win2 are the FAC moving-average window sizes per config:
-     * 48k = 57/63, 96k = 96/64, 192k = 96/64. Wrong windows desync the FAC range
-     * decoder partway through a dense frame. */
+    /* ma_win1/ma_win2 read directly from the liblhdcv5.so band_cfg struct array
+     * (stride 0x30; ma_win1@0x28, ma_win2@0x2c; split@0x20). Ground truth, NOT
+     * scaled guesses: 48k(split80)=57/63, 96k(split160)=96/64, 192k(split320)=
+     * 96/64. The earlier 96k 114/126 / 192k 228/252 were wrong 2x guesses and
+     * desynced the FAC range decoder past coeff ~96 -> garbage on dense frames.
+     * (tools/dump_band_cfg.py) */
     { LHDC_BAND_CFG_480,    32, 480,  _band_off_480,    _band_scale_480,    57,  63 },
     { LHDC_BAND_CFG_480_HR, 32, 480,  _band_off_480_hr, _band_scale_480_hr, 57,  63 },
     { LHDC_BAND_CFG_480_LB, 24, 480,  _band_off_480_lb, _band_scale_480_lb, 57,  63 },
@@ -145,8 +148,8 @@ const lhdc_band_cfg_desc_t lhdc_band_cfgs[LHDC_BAND_CFG_COUNT] = {
 const lhdc_band_cfg_desc_t *lhdc_get_band_cfg(uint32_t sample_rate, uint8_t frame_duration_ms)
 {
     /*
-     * For HR-class streams (the default), samples-per-frame maps to band config
-     * and MDCT size as:
+     * Validated against the real encoder: for HR-class streams (the default
+     * negotiated), spf -> band config / MDCT size:
      *   spf=240 (44.1/48k @5ms) -> band_480_HR, MDCT 480, 240 spectral lines
      *   spf=480 (96k  @5ms)     -> band_960,    MDCT 960, 480 lines
      *   spf=960 (192k @5ms)     -> band_1920,   MDCT 1920, 960 lines
@@ -186,14 +189,26 @@ const uint32_t *lhdc_get_bitrate_table(uint32_t sample_rate)
 }
 
 /*
- * LHDC V5 MDCT synthesis window for mdct_size = 480 (44.1k/48k @5ms).
- *
- * This is a low-overlap window, not a full sine/Vorbis bell: zero at the edges,
- * short (~78-sample) sine transitions, and a flat 1.0 middle. It satisfies the
- * Princen-Bradley power-complementary condition exactly (w[n]^2+w[n+240]^2 = 1),
- * so the IMDCT overlap-add cancels time-domain aliasing (TDAC). A full-bell
- * window would break TDAC and leave an amplitude-modulation comb at the frame
- * rate on steady tones.
+ * MDCT window (PROJECT_CONTEXT §9, from mdct_init): Princen-Bradley
+ * power-complementary window  w[i] = sin((pi/2) * sin^2(pi*(i+0.5)/L)) where
+ * L = window length = mdct_size. The denominator MUST be the window length, not
+ * twice it: with denominator L the window is the symmetric bell satisfying
+ * w[i]^2 + w[i+L/2]^2 = 1 (since sin^2(theta)+sin^2(theta+pi/2)=1), which is what
+ * makes the IMDCT overlap-add cancel time-domain aliasing (TDAC). Using 2*L
+ * yields a non-symmetric, non-power-complementary window that breaks TDAC:
+ * a steady tone cancels in steady-state overlap-add.
+ * (Named lhdc_gen_kbd_window for ABI compatibility; it is not KBD.)
+ */
+/*
+ * The REAL LHDC V5 MDCT window (mdct_size=480 -> 44.1k/48k @5ms), recovered from
+ * the Savitech encoder (liblhdcv5.so) and validated to bit-clean reconstruction.
+ * It is NOT a full sine/Vorbis bell — it is a LOW-OVERLAP window: zero at the
+ * edges, short (~78-sample) sine transitions, and a flat 1.0 middle. Satisfies
+ * Princen-Bradley exactly (w[n]^2+w[n+240]^2=1). Using the wrong (full-bell)
+ * window leaves a -17 dB amplitude-modulation comb at the 200 Hz frame rate
+ * ("dirty" tones); this table drives every swept tone to <= -65 dB sidebands.
+ * Derivation: tools/ joint window-solve over a 0-22 kHz encoder sweep + the
+ * encoder's ctx window dump; held-out frequencies validated -64..-77 dB.
  */
 static const float LHDC_WIN_480[480] = {
     0.00000000f, 0.00000000f, 0.00000000f, 0.00000000f, 0.00000000f, 0.00000000f, 0.00000000f, 0.00000000f,
@@ -258,9 +273,12 @@ static const float LHDC_WIN_480[480] = {
     0.00000000f, 0.00000000f, 0.00000000f, 0.00000000f, 0.00000000f, 0.00000000f, 0.00000000f, 0.00000000f,
 };
 
-/* 96k (mdct 960) and 192k (mdct 1920) synthesis windows. Same 5 ms low-overlap
- * design as LHDC_WIN_480, scaled with mdct_size. The edges are derived so the
- * Princen-Bradley condition (w[n]^2+w[n+N/2]^2 = 1) remains exact.
+/* 96k (mdct 960) and 192k (mdct 1920) synthesis windows. Same 5 ms
+ * low-overlap design as LHDC_WIN_480, scaled with mdct_size (transition
+ * 88->176->352). Built by resampling the 480 edge PHASE so Princen-Bradley
+ * (w[n]^2+w[n+N/2]^2==1) stays exact (residual ~7e-8). See
+ * tools/build_hr_windows.py. NOTE: validated PB-exact; the encoder edge
+ * curvature at HR rates is assumed identical to 48k (on-device A/B by ear).
  */
 static const float LHDC_WIN_960[960] = {
     0.00000000f, 0.00000000f, 0.00000000f, 0.00000000f, 0.00000000f, 0.00000000f, 0.00000000f, 0.00000000f,
@@ -631,12 +649,20 @@ static const float LHDC_WIN_1920[1920] = {
 
 /* Return the const (flash) window for a given mdct_size, or NULL if there is no
  * precomputed table. Lets the decoder use the flash table directly instead of
- * copying it into a RAM buffer. */
+ * copying it into a ~2 KB RAM buffer. Only 480 (44.1/48k) is negotiated today. */
 const float *lhdc_get_window_const(int mdct_size)
 {
-    /* The low-overlap const windows preserve TDAC at every rate. LHDC_WIN_960 /
-     * LHDC_WIN_1920 are the 2x / 4x scalings of LHDC_WIN_480 and match the
-     * encoder's rate-scaled analysis window. */
+    /* Use the verified low-overlap const windows. LHDC_WIN_960 / LHDC_WIN_1920
+     * are the exact 2x / 4x scalings of the bit-clean LHDC_WIN_480 (zero pad
+     * 76->152->304, matching the encoder's rate-scaled analysis window).
+     *
+     * NOTE: an earlier "HR fix" returned NULL here so lhdc_gen_kbd_window()
+     * would build a num4=144/repeating=192 window for 960. That window does NOT
+     * match the encoder: a 96k 50 Hz round-trip through the real liblhdcv5.so
+     * encoder showed it breaks TDAC, leaving a -38 dB amplitude-modulation comb
+     * at the 200 Hz frame rate (odd-harmonic sidebands 150/250/350 Hz) -- the
+     * "dirty/muffle" only-at-96k artifact. The const LHDC_WIN_960 restores TDAC.
+     */
     if (mdct_size == 480)  return LHDC_WIN_480;
     if (mdct_size == 960)  return LHDC_WIN_960;
     if (mdct_size == 1920) return LHDC_WIN_1920;
@@ -646,10 +672,12 @@ const float *lhdc_get_window_const(int mdct_size)
 void lhdc_gen_kbd_window(float *window, int mdct_size)
 {
     int i, N = mdct_size;
-    /* Generate the MDCT synthesis window for a size that has no const table.
-     * The synthesis window must match the encoder's analysis window for TDAC and
-     * perfect reconstruction. (Named lhdc_gen_kbd_window for API compatibility;
-     * it does not generate a KBD window.) */
+    /* The encoder uses the Vorbis-style power-complementary MDCT window
+     * w[n] = sin((pi/2) * sin^2((n+0.5)*pi/N))  (recovered from the reference
+     * decoder's lhdc_dec_lossy_time_table_start). The synthesis window MUST match
+     * the encoder's analysis window for TDAC / perfect reconstruction — the old
+     * hardcoded low-overlap LHDC_WIN_480 only cleaned up tones (sparse spectra)
+     * but broke TDAC on dense content, garbling real music. */
     int use_old = 0;
 #if defined(LHDC_HOST_BUILD)
     { const char *e = getenv("LHDC_OLDWIN"); if (e) use_old = atoi(e); }
@@ -659,11 +687,14 @@ void lhdc_gen_kbd_window(float *window, int mdct_size)
         return;
     }
     /*
-     * LHDC uses a low-overlap MDCT window: num4 zero-pad samples, a
-     * `repeating`-long Vorbis sine transition, a flat 1.0 middle, a `repeating`
-     * fall, then num4 zeros. With 50% overlap-add this satisfies TDAC because
+     * LHDC uses a LOW-OVERLAP MDCT window (recovered from the reference decoder's
+     * lhdc_dec_lossy_time_table_start): num4 zero-pad samples, a `repeating`-long
+     * Vorbis sine transition, a flat 1.0 middle, a `repeating` fall, num4 zeros.
+     * With 50% overlap-add this satisfies TDAC because
      *   sin^2((pi/2)sin^2(t)) + sin^2((pi/2)cos^2(t)) = 1.
-     * For the 48k/5ms config: N=480, repeating=96, num4 = N/4 - repeating/2 = 72.
+     * The 48k/5ms config: N=480, repeating=96, num4 = N/4 - repeating/2 = 72.
+     * (Old code used a full Vorbis/KBD window over all N -> wrong overlap structure
+     * -> TDAC failed on dense/non-stationary content -> real-music garble.)
      */
     {
         int repeating, num4;

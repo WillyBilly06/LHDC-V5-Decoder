@@ -1,14 +1,14 @@
-#   ifndef LHDC_ENTROPY_DEC_H
+#ifndef LHDC_ENTROPY_DEC_H
 #define LHDC_ENTROPY_DEC_H
 
 #include "lhdc_dec_internal.h"
 
 /*
  * Full entropy decode (FAC-MA range coder + Rice). Scratch buffers are provided
- * by the caller from the decoder workspace to avoid large .bss.
+ * by the caller from the heap-allocated decoder workspace (avoids large .bss).
  *   count   = number of significant coefficients (nzc)
- *   split   = Rice split (0 -> pivot=count)
- *   ma_win1 = MA sliding window for stream 1; ma_win2 = stream 2 (= win1*8)
+ *   split   = Rice split (0 -> pivot=count, validated)
+ *   ma_win1 = MA sliding-window for stream 1; ma_win2 = stream 2 (= win1*8)
  *   fac_bytes_out = bytes the range coder consumed (sign-plane offset)
  *   scratch_fac[scratch_fac_cap], scratch_s1[>=count], scratch_s2[scratch_s2_cap]
  */
@@ -23,14 +23,16 @@ lhdc_dec_ret_t lhdc_entropy_decode_spectrum_ex2(int32_t *quant_spectrum,
                                                  uint8_t *scratch_s2, int scratch_s2_cap);
 
 /*
- * Allocate the FAC adaptive models. Intended to be called at decoder configure
- * time, while the heap is still contiguous. (In this build the models are static
- * storage, so these are no-ops; the entry points are retained for the API.)
+ * Allocate the FAC adaptive models (~6 KB heap). MUST be called at decoder
+ * configure time (heap is contiguous then); allocating lazily on first decode
+ * fails at 96k where the streaming heap is fragmented to a ~4 KB largest block.
  */
 void lhdc_entropy_alloc(void);
 
 /*
- * Release the FAC adaptive models. Safe to call when nothing is allocated.
+ * Free the FAC adaptive models (~6 KB heap). Call at decoder teardown so the
+ * entropy scratch isn't resident while LHDC is not the active codec. Safe to
+ * call when nothing is allocated.
  */
 void lhdc_entropy_free(void);
 

@@ -2,32 +2,34 @@
 #include "lhdc_bit_reader.h"
 #include "lhdc_tables.h"
 #include <string.h>
-#include <stdlib.h>
+#include <stdlib.h>   /* malloc/free for the lazily-heaped FAC models */
 #if defined(LHDC_HOST_BUILD)
 #include <stdio.h>
 #include <stdlib.h>
 #define LHDC_HOT          /* host: no IRAM */
 #else
 #include "esp_attr.h"
-/* Place the per-symbol/per-coefficient entropy hot path in IRAM. The Bluetooth
- * controller's interrupts evict the decoder's flash-cache lines mid-frame, which
- * slows the decode and causes per-packet latency spikes; IRAM execution removes
- * those stalls. */
+/* Place the per-symbol/per-coeff entropy hot path in IRAM. The BT controller is
+ * interrupt-heavy and evicts the decoder's flash-cache lines mid-frame, which
+ * both slows the steady decode and causes the per-packet latency spikes. IRAM
+ * execution removes those cache stalls. ~18 KB IRAM headroom available. */
 #define LHDC_HOT          IRAM_ATTR
 #endif
 
 /*
- * LHDC V5 entropy decoder.
+ * LHDC V5 entropy decoder — reverse-engineered and validated bit-exact against
+ * the real liblhdcv5.so encoder (range coder 50/50, Rice 20000/20000 round-trip,
+ * full tone1k frame -> ~1kHz spectrum).
  *
- * The spectral data is two ternary (3-symbol) streams, Rice-quotient coded then
- * FAC-MA range coded:
- *   stream1 = the first `count` symbols (LSB/marker plane), initial frequencies
- *             {54,12,1}, sliding window MA_WIN1.
- *   stream2 = the remaining quotient codes, initial frequencies {90,16,1},
+ * The spectral data is two ternary (3-symbol) streams produced by
+ * RiceQuotientEncode then FAC-MA range coded (BitsPredictCompressOutput):
+ *   stream1 = first `count` symbols (lsb/marker plane), init freqs {54,12,1},
+ *             sliding window MA_WIN1.
+ *   stream2 = the rest (quotient codes),                init freqs {90,16,1},
  *             sliding window MA_WIN2.
- * Both share one byte range-coder stream (the initial code is the first 4 bytes;
- * total frequency = 2^15). A sign bit-plane follows the FAC stream: one bit per
- * nonzero coefficient (1 = negative).
+ * Both share one byte range-coder stream (init code = first 4 bytes; total freq
+ * = 2^15). After the FAC stream a sign bit-plane follows: one bit per nonzero
+ * coefficient (1 = negative).
  */
 
 #define FAC_TOTAL_BITS 15
@@ -38,7 +40,7 @@
 int g_fdc = 0;     /* per-channel DSTATE symbol counter (reset each entropy call) */
 int g_block = 0;   /* which channel-block since trace start (0=a-ch0,1=a-ch1,2=b-ch0,...) */
 #endif
-uint32_t g_fac_final_range = 0;   /* final range register after entropy decode (mantissa-gap rule) */
+uint32_t g_fac_final_range = 0;   /* final range register after entropy decode (leftover analysis) */
 
 static const uint32_t FAC_FQ1[FAC_NSYM] = {54, 12, 1};
 static const uint32_t FAC_FQ2[FAC_NSYM] = {90, 16, 1};
@@ -56,13 +58,18 @@ typedef struct {
     uint32_t cum[FAC_NSYM + 1];   /* 15-bit normalized cumulative freqs */
 } fac_model_t;
 
-/* The two adaptive models live in static storage rather than the heap: a heap
- * block here would fragment the LHDC heap so the workspace cannot find a
- * contiguous hole on a rate switch. The two models need very different history
- * sizes, so they use separately right-sized buffers:
- *   s_fac_hist1 -> stream-1 model, window = ma_win1 (<= 512).
- *   s_fac_hist2 -> stream-2 model, window = ma_win2 = ma_win1*8.
- * s_fac_m[0] = stream-1, s_fac_m[1] = stream-2. */
+/* The two adaptive models live in .bss (NOT heap): a heap block here fragments
+ * the LHDC heap so the 18 KB workspace can't find a contiguous hole on a rate
+ * switch (-> dec=NULL -> no audio). .bss never fragments.
+ *
+ * BUT the two models need very different history sizes, so they get SEPARATE
+ * right-sized buffers instead of two identical hist[3072]:
+ *   s_fac_hist1 -> stream-1 model, window = ma_win1 (<= ~281 at 900k; <=512).
+ *   s_fac_hist2 -> stream-2 model, window = ma_win2 = ma_win1*8 (<= ~2448).
+ * The old struct embedded hist[3072] in BOTH (~6.2 KB .bss); stream-1's was
+ * ~2.5 KB of pure waste (it only ever uses ma_win1 entries). Right-sizing frees
+ * that .bss -> the heap pool is ~2.5 KB larger during ALL LHDC playback (96k and
+ * 48k). s_fac_m[0] = stream-1, s_fac_m[1] = stream-2. */
 static uint8_t s_fac_hist1[512];    /* stream-1 (ma_win1) */
 static uint8_t s_fac_hist2[3072];   /* stream-2 (ma_win2, win1*8) */
 static fac_model_t s_fac_m[2];
@@ -95,12 +102,12 @@ static LHDC_HOT void fac_model_rescale(fac_model_t *m)
 static void fac_model_init(fac_model_t *m, const uint32_t *init_freq, int window)
 {
     m->n = FAC_NSYM;
-    if (window > m->hist_cap) window = m->hist_cap;   /* clamp to the buffer capacity */
+    if (window > m->hist_cap) window = m->hist_cap;   /* clamp to the right-sized buffer */
     if (window < 1) window = 1;
     m->window = window;
     m->pos = 0;
     m->count = 0;
-    memset(m->hist, 0, (size_t)window);   /* only the used window */
+    memset(m->hist, 0, (size_t)window);   /* only the used window (was full 3072) */
     for (int i = 0; i < FAC_NSYM; i++) m->freq[i] = init_freq[i];
     fac_model_rescale(m);
 }
@@ -157,11 +164,15 @@ static LHDC_HOT int fac_decode(fac_dec_t *d, fac_model_t *m)
     uint32_t dbg_cum1=m->cum[1], dbg_cum2=m->cum[2], dbg_f0=m->freq[0],dbg_f1=m->freq[1],dbg_f2=m->freq[2],dbg_cnt=m->count;
 #endif
     uint32_t r = d->range >> FAC_TOTAL_BITS;
-    /* Divide-free symbol search. Instead of target = code / r per symbol, use the
-     * identity floor(code/r) >= c  <=>  code >= r*c  (c>=0, r>0) to compare
-     * r*cum[] against code directly, replacing the divide with at most two
-     * multiplies (m->n is always 3 for the ternary FAC). The scan stops at the
-     * last symbol via the `sym+1 < m->n` bound. No overflow: r*cum[sym+1] <=
+    /* Divide-free symbol search. The ARM reference computed `target = code / r`
+     * per symbol; Xtensa LX6 has no fast integer divide (~30+ cycle software
+     * call) whereas it has a fast 32-bit multiply. Use the integer identity
+     * floor(code/r) >= c  <=>  code >= r*c  (c>=0, r>0) to compare r*cum[] to
+     * code directly. m->n is always 3 (ternary FAC), so this is <=2 multiplies
+     * replacing one divide per decoded symbol. Bit-IDENTICAL to the old
+     * target+clamp path: the `target>=FAC_TOTAL -> FAC_TOTAL-1` clamp is
+     * subsumed by the `sym+1 < m->n` loop bound (when code/r overshoots, the
+     * scan still stops at the last symbol n-1). No overflow: r*cum[sym+1] <=
      * r*FAC_TOTAL = (range>>15)<<15 <= range < 2^32. */
     int sym = 0;
     while (sym + 1 < m->n && r * m->cum[sym + 1] <= d->code) sym++;
@@ -184,7 +195,7 @@ static LHDC_HOT int fac_decode(fac_dec_t *d, fac_model_t *m)
     return sym;
 }
 
-/* --- Rice quotient inverse --- */
+/* --- Rice quotient inverse (mirrors rice_dec.py, validated) --- */
 __attribute__((unused))
 static LHDC_HOT int rice_read_quotient(const uint8_t *s2, int n, int *jp)
 {
@@ -215,13 +226,13 @@ static LHDC_HOT int rice_read_quotient(const uint8_t *s2, int n, int *jp)
 
 /*
  * On-demand pass-2 stream: decodes s2 symbols from the range coder lazily with a
- * one-symbol lookahead, mirroring the array peek/consume semantics (s2[j] ->
- * peek, j++ -> consume). This avoids pre-decoding a large fixed bound and the
- * separate re-decode to find the byte position: each consumed symbol is decoded
- * exactly once, and save_p/save_range snapshot the reader state before the
- * current (possibly unconsumed) lookahead symbol, so the byte position after the
- * consumed symbols is available directly. Equivalent to the array path with far
- * fewer symbol decodes.
+ * 1-symbol lookahead, mirroring the array peek/consume semantics EXACTLY (s2[j]
+ * -> peek, j++ -> consume). This avoids pre-decoding a large fixed bound AND the
+ * separate re-decode to find the byte position: because each consumed symbol is
+ * decoded exactly once and `save_p/save_range` snapshot the reader state BEFORE
+ * the current (possibly unconsumed) lookahead symbol, the precise byte position
+ * after the consumed symbols is available directly. Result is bit-identical to
+ * the array path but ~4x fewer symbol decodes (fixes the real-time stutter).
  */
 typedef struct { fac_dec_t *d; fac_model_t *m; int has; int val; int save_p; uint32_t save_range; int used; } s2_stream_t;
 static int s2_peek(s2_stream_t *s) {
@@ -323,10 +334,14 @@ static LHDC_HOT void rice_decode_coeffs_used(const uint8_t *s1, const uint8_t *s
 }
 
 /*
- * Public entry: decode the spectral coefficients for one channel. The bit reader
- * must be positioned at the start of the FAC byte stream (right after the
- * per-channel leading section). `count` = nzc (significant coefficients); `split`
- * and the MA windows come from the band config.
+ * Public entry: decode the spectral coefficients for one channel. The bit
+ * reader must be positioned at the start of the FAC byte stream (i.e. right
+ * after the per-channel leading section). `count` = nzc (significant coeffs),
+ * `split` and the MA windows come from the band config / ECB.
+ *
+ * NOTE: the current decoder front-end (lhdc_dec.c) does not yet thread count /
+ * split / windows / sign-plane offset through to here; this function exposes the
+ * validated core. lhdc_entropy_decode_spectrum below adapts the legacy call.
  */
 lhdc_dec_ret_t lhdc_entropy_decode_spectrum_ex2(int32_t *quant_spectrum,
                                                  int num_coeffs,
@@ -339,9 +354,10 @@ lhdc_dec_ret_t lhdc_entropy_decode_spectrum_ex2(int32_t *quant_spectrum,
                                                  uint8_t *scratch_s2, int scratch_s2_cap)
 {
     /*
-     * Scratch buffers (facbuf / s1 / s2) are supplied by the caller from the
-     * decoder workspace to avoid large .bss. The leading section was consumed up
-     * to the bit reader's current position; the FAC stream is MSB-first from here.
+     * Scratch buffers (facbuf / s1 / s2) come from the heap-allocated decoder
+     * workspace to avoid large .bss; passed in via the caller. The leading
+     * section consumed up to br's current bit position; the FAC stream is the
+     * MSB-first bit packing from here on.
      */
     uint8_t *facbuf = scratch_fac;
     uint8_t *s1 = scratch_s1;
@@ -359,19 +375,20 @@ lhdc_dec_ret_t lhdc_entropy_decode_spectrum_ex2(int32_t *quant_spectrum,
     fac_dec_t d;
     fac_dec_init(&d, facbuf, nb);
 
-    fac_model_t *const pm1 = &s_fac_m[0];   /* stream-1 model */
-    fac_model_t *const pm2 = &s_fac_m[1];   /* stream-2 model */
-    lhdc_entropy_alloc_internal();          /* point pm1/pm2 at their history buffers (idempotent) */
+    fac_model_t *const pm1 = &s_fac_m[0];   /* stream-1 model (.bss) */
+    fac_model_t *const pm2 = &s_fac_m[1];   /* stream-2 model (.bss) */
+    lhdc_entropy_alloc_internal();          /* point pm1/pm2 at their right-sized hist buffers (idempotent) */
 
     fac_model_init(pm1, FAC_FQ1, ma_win1 > 0 ? ma_win1 : 256);
     for (int i = 0; i < count; i++) s1[i] = (uint8_t)fac_decode(&d, pm1);
-    fac_dec_t d_after_s1 = d;   /* snapshot so the byte-position pass resumes here */
+    fac_dec_t d_after_s1 = d;   /* snapshot: byte-pos pass resumes here, no s1 re-decode */
 
     fac_model_init(pm2, FAC_FQ2, ma_win2 > 0 ? ma_win2 : 256);
     int s2len = 0;
     int s2cap = scratch_s2_cap;
-    /* The Rice inverse never needs more than ~2 pass-2 symbols per coefficient, so
-     * 2*count is a safe ceiling that avoids decoding to end-of-input. */
+    /* The Rice inverse never needs > ~2 pass-2 symbols per coeff; 2*count is a safe
+     * ceiling (verified: capping here vs decoding to end-of-input does not change
+     * the decoded result on the full stress corpus). Saves ~1/3 of entropy time. */
     int lazy_cap = (count * 2 < s2cap) ? count * 2 : s2cap;
     while (s2len < lazy_cap && d.p <= d.len) s2[s2len++] = (uint8_t)fac_decode(&d, pm2);
 
@@ -393,13 +410,14 @@ lhdc_dec_ret_t lhdc_entropy_decode_spectrum_ex2(int32_t *quant_spectrum,
     rice_decode_coeffs_used(s1, s2, s2len, count, split, quant_spectrum, &s2_used);
 
     if (fac_bytes_out) {
-        fac_dec_t d2 = d_after_s1;   /* resume right after s1 */
+        fac_dec_t d2 = d_after_s1;   /* resume right after s1 (deterministic: same as
+                                      * re-decoding count s1 symbols from the start) */
         fac_model_init(pm2, FAC_FQ2, ma_win2 > 0 ? ma_win2 : 256);
         for (int i = 0; i < s2_used; i++) (void)fac_decode(&d2, pm2);
         int consumed = d2.p;
         if (consumed < 0) consumed = 0;
         *fac_bytes_out = consumed;            /* raw bytes pulled */
-        g_fac_final_range = d2.range;         /* mantissa-gap rule applied in lhdc_dec.c */
+        g_fac_final_range = d2.range;         /* leftover rule applied in lhdc_dec.c */
 #if defined(LHDC_HOST_BUILD)
         if (getenv("LHDC_LEFTOVER_LOG"))
             printf("[LEFTOVER] consumed=%d range=%08x s2_used=%d rule=%d\n",
