@@ -13,16 +13,15 @@
 static const tA2DP_LHDCV5_CIE a2dp_lhdcv5_sink_caps = {
     A2DP_LHDCV5_VENDOR_ID,
     A2DP_LHDCV5_CODEC_ID,
-    /* Advertise ONLY 44.1/48 kHz. The decoder workspace is sized for the 48 kHz
-     * (240-spf / MDCT-480) path to keep RAM minimal (~9 KB). Advertising 96/192k
-     * would let the phone negotiate a frame size we can't decode in that budget
-     * (and the 192k frames don't match our validated 48k framing). */
-    A2DP_LHDCV5_SAMPLING_FREQ_44100 |
+    /* Advertise all four rates. NOTE: this is a bitmask (bitwise OR), so the order
+     * below does not change the advertised value or any priority — 192k listed
+     * first here is purely cosmetic. The source (phone) picks the rate. */
+    A2DP_LHDCV5_SAMPLING_FREQ_192000 |  /* 192k: fast IMDCT-1920 */
+        A2DP_LHDCV5_SAMPLING_FREQ_96000 |   /* 96k: fast IMDCT-960 */
         A2DP_LHDCV5_SAMPLING_FREQ_48000 |
-        A2DP_LHDCV5_SAMPLING_FREQ_96000 |  /* 96k: rate-sized workspace + fast IMDCT-960 */
-        A2DP_LHDCV5_SAMPLING_FREQ_192000,  /* 192k: fast IMDCT-1920; single-core decode (cross-core WIP) */
-    A2DP_LHDCV5_BITS_PER_SAMPLE_16 |
-        A2DP_LHDCV5_BITS_PER_SAMPLE_24,
+        A2DP_LHDCV5_SAMPLING_FREQ_44100,
+    A2DP_LHDCV5_BITS_PER_SAMPLE_24 |
+        A2DP_LHDCV5_BITS_PER_SAMPLE_16,
     A2DP_LHDCV5_CHANNEL_MODE_STEREO,
     A2DP_LHDCV5_VER_1,
     A2DP_LHDCV5_FRAME_LEN_5MS,

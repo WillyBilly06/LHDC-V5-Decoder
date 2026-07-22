@@ -17,20 +17,21 @@ reconstructs interleaved stereo PCM.
 1. [Features](#features)
 2. [Hardware requirements](#hardware-requirements)
 3. [Repository layout](#repository-layout)
-4. [Quick start](#quick-start)
-5. [Decoder API reference](#decoder-api-reference)
-6. [Data types](#data-types)
-7. [Memory model](#memory-model)
-8. [How the decode pipeline works](#how-the-decode-pipeline-works)
-9. [Integrating into an ESP-IDF A2DP sink](#integrating-into-an-esp-idf-a2dp-sink)
-10. [192 kHz / PSRAM build](#192-khz--psram-build)
-11. [Testing](#testing)
-12. [Verification results](#verification-results)
-13. [Performance & Xtensa tuning](#performance--xtensa-tuning)
-14. [Diagnostics](#diagnostics)
-15. [Troubleshooting](#troubleshooting)
-16. [Limitations](#limitations)
-17. [License](#license)
+4. [Add to your ESP-IDF project](#add-to-your-esp-idf-project)
+5. [Quick start](#quick-start)
+6. [Decoder API reference](#decoder-api-reference)
+7. [Data types](#data-types)
+8. [Memory model](#memory-model)
+9. [How the decode pipeline works](#how-the-decode-pipeline-works)
+10. [Integrating into an ESP-IDF A2DP sink](#integrating-into-an-esp-idf-a2dp-sink)
+11. [192 kHz / PSRAM build](#192-khz--psram-build)
+12. [Testing](#testing)
+13. [Verification results](#verification-results)
+14. [Performance & Xtensa tuning](#performance--xtensa-tuning)
+15. [Diagnostics](#diagnostics)
+16. [Troubleshooting](#troubleshooting)
+17. [Limitations](#limitations)
+18. [License](#license)
 
 ---
 
@@ -75,6 +76,9 @@ rate; real-time playback is solid at 44.1/48/96 kHz.
 ## Repository layout
 
 ```
+CMakeLists.txt       ESP-IDF component manifest — makes this repo a drop-in component
+idf_component.yml    Component-manager metadata (version, description)
+
 decoder/             Core decoder (portable C; no ESP-IDF dependency in the math)
   lhdc_dec.c/.h         Public API, top-level frame decode, per-channel pipeline, gain/level
   lhdc_dec_internal.h   Decoder struct, size limits, workspace layout
@@ -101,6 +105,39 @@ docs/                Technical notes on specific fixes (windowing, channel selec
 
 The minimum you need to decode is everything in `decoder/`. `a2dp_integration/` is only
 needed when wiring the decoder into a Bluedroid A2DP sink.
+
+---
+
+## Add to your ESP-IDF project
+
+This repo **is** a self-contained ESP-IDF component. Drop it into your project's
+`components/` directory — copy it, or add it as a git submodule:
+
+```sh
+cd your_project
+git submodule add https://github.com/WillyBilly06/LHDC-V5-Decoder.git \
+    components/lhdcv5_decoder
+```
+
+Then list it in the `REQUIRES` of whichever component calls the decoder — e.g. in
+`main/CMakeLists.txt`:
+
+```cmake
+idf_component_register(SRCS "main.c"
+                       INCLUDE_DIRS "."
+                       REQUIRES lhdcv5_decoder)
+```
+
+That's it — `#include "lhdc_dec.h"` and the decoder API is available (see
+[Quick start](#quick-start)). The component compiles only the portable decoder in
+`decoder/`, pulls in just `log` / `esp_common` / `esp_timer`, and builds for the
+classic dual-core ESP32 (and any variant with enough internal RAM). The
+`a2dp_integration/` and `test/` folders are shipped for reference but are **not**
+part of the component build.
+
+> **Decoding audio from a phone (A2DP sink)** is a further step: it requires
+> patching Bluedroid's vendor-codec path with the files in `a2dp_integration/`.
+> See [Integrating into an ESP-IDF A2DP sink](#integrating-into-an-esp-idf-a2dp-sink).
 
 ---
 
