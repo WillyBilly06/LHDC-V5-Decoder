@@ -70,6 +70,14 @@ int main(int argc, char **argv)
     lhdc_dec_config_t cfg={.sample_rate=sr,.bit_depth=bps,.frame_duration=5,
                            .channels=ch,.max_frame_bytes=16384,.lossless_enable=0};
     lhdc_decoder_t *dec=lhdc_dec_init(ws,&cfg);
+    /* Low-freq diag: toggle decode-path options from env to localize the sub-35Hz
+     * artifact. LHDC_OLA/SNS/REF/REV -> lhdc_diag_set_one("ola"/"sns"/"ref"/"rev"). */
+    { extern int lhdc_diag_set_one(const char*,int); const char*e;
+      if((e=getenv("LHDC_OLA"))) { lhdc_diag_set_one("ola",atoi(e)); printf("DIAG ola=%d\n",atoi(e)); }
+      if((e=getenv("LHDC_SNS"))) { lhdc_diag_set_one("sns",atoi(e)); printf("DIAG sns=%d\n",atoi(e)); }
+      if((e=getenv("LHDC_REF"))) { lhdc_diag_set_one("ref",atoi(e)); printf("DIAG ref=%d\n",atoi(e)); }
+      if((e=getenv("LHDC_REV"))) { lhdc_diag_set_one("rev",atoi(e)); printf("DIAG rev=%d\n",atoi(e)); }
+    }
 
     FILE *fin=fopen(inpath,"wb"), *fout=fopen(outpath,"wb");
     int32_t *inpcm=malloc(spf*ch*sizeof(int32_t));
@@ -226,6 +234,53 @@ int main(int argc, char **argv)
             fprintf(stderr,"encode err fr=%d\n",fr); break;
         }
         printf("FR %d written=%u oframes=%u\n", fr, written, oframes);
+        /* Per-frame encoder magnitude dump (aligned to input frame fr). Record:
+         * int32 N, int32 nzc, then N int32 mags (significant nzc at tail). */
+        if(getenv("LHDC_DUMP_ENCMAG") && fr>=4){
+            void *ws = *(void**)((char*)enc + 88);
+            if(ws){ char *ecb=(char*)((void**)ws)[1];
+                int N=*(int*)(ecb+0xc); int enzc=*(int*)(ecb+0x7228);
+                int *base=(int*)(ecb+0x2724);
+                FILE*f=fopen("/data/local/tmp/lhdcrt/encmag.bin","ab");
+                if(f){ fwrite(&N,4,1,f); fwrite(&enzc,4,1,f); fwrite(base,4,N,f); fclose(f); } }
+        }
+        /* Per-frame encoder SNS scale factors (ECB+0x26f8), 64 int32 per frame. */
+        if(getenv("LHDC_DUMP_ENCSF") && fr>=4){
+            void *ws = *(void**)((char*)enc + 88);
+            if(ws){ char *ecb=(char*)((void**)ws)[1];
+                int *sf=(int*)(ecb+0x26f8);
+                FILE*f=fopen("/data/local/tmp/lhdcrt/encsf.bin","ab");
+                if(f){ fwrite(sf,4,64,f); fclose(f); } }
+        }
+        /* ENCODER GROUND TRUTH: read the encoder's internal per-coeff shift[]/mag[]
+         * from the ECB after encode. workspace = para->lh5_enc (offset +88); ECB =
+         * workspace[1] (get_mem_content_addr(ws,1) == ws[1]). shift[] @ECB+0x3624,
+         * mag[] @ECB+0x2724+(N-nzc)*4, N @+0xc, nzc @+0x7228, mode @+0x722C. Use
+         * stationary mode (tone_hz=0) so this last-subframe state == every frame. */
+        if(fr==TRACE_FR){
+            void *ws = *(void**)((char*)enc + 88);
+            printf("[ENCDBG] fr=%d written=%u enc=%p ws=%p\n", fr, written, (void*)enc, ws);
+            if(ws){
+                char *ecb = (char*)((void**)ws)[1];
+                int N   = *(int*)(ecb + 0xc);
+                int enzc= *(int*)(ecb + 0x7228);
+                int emd = *(int*)(ecb + 0x722C);
+                int *esh= (int*)(ecb + 0x3624);
+                int *emg= (int*)(ecb + 0x2724 + (long)(N - enzc)*4);
+                printf("[ENCGT] N=%d nzc=%d mode=%d\n", N, enzc, emd);
+                for(int k=0;k<enzc && k<240;k++)
+                    printf("[ENCGT] k=%d shift=%d mag=%d\n", k, esh[k], emg[k]);
+                /* Dump encoder analysis window (slot 10 = MDCT_WIN) and the
+                 * encoder's pre-quant MDCT spectrum (slot 3 = MDCT_CH). Raw floats. */
+                { void *mwin = ((void**)ws)[10]; void *mch = ((void**)ws)[3];
+                  printf("[ENCPTR] MDCT_WIN=%p MDCT_CH=%p\n", mwin, mch);
+                  if(mwin){ FILE*f=fopen("/data/local/tmp/lhdcrt/enc_win.bin","wb");
+                            if(f){ fwrite(mwin,1,4*2048,f); fclose(f); } }
+                  if(mch){ FILE*f=fopen("/data/local/tmp/lhdcrt/enc_mdct.bin","wb");
+                           if(f){ fwrite(mch,1,4*2048,f); fclose(f); } }
+                }
+            }
+        }
         if(fr>=4) fwrite(inpcm,sizeof(int32_t),spf*ch,fin);  /* record EVERY input frame (incl. buffered) for round-trip alignment */
         if(written==0) continue;
         if(fr==TRACE_FR){ FILE*ef=fopen("/data/local/tmp/lhdccal/encframe.bin","wb");
