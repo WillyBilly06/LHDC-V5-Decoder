@@ -801,13 +801,19 @@ static lhdc_dec_ret_t lhdc_dec_decode_channel(lhdc_decoder_t *dec,
             int fr = fac_bytes - best_delta; if (fr < 0) fr = 0;
             int64_t pk = lhdc_dec_mant_plane(coeff, qs, cnt, pl, total_bits,
                                              fac_start_bit + fr * 8, pred_mode, resid_val);
-            /* The 2-vs-3-byte arith-stop gap can be mispicked on dense/high-bitrate
-             * frames; the wrong start desyncs the shift predictor and |M| overshoots
-             * 24-bit full scale by 2-11x (heard as the loud-pop/conceal garble at
-             * 900 kbps). A correctly decoded frame can't exceed full scale, so if it
-             * does, retry the OTHER gap and keep whichever stays in range. Only the
-             * (~10% at high bitrate) bad frames pay the extra pass. */
-            if (forced < 0 && pk > 8388607) {
+            /* Desync backstop for the 2-vs-3-byte arith-stop gap. The range rule
+             * above is exact (it mirrors the encoder's arith clear: final range
+             * <= 0x2000000 flushes 2 bytes, else 1), so a retry should only fire
+             * on a genuine desync. The threshold must NOT be 24-bit full scale:
+             * the encoder's quantizer output |M| = round(spec * level) is not
+             * clamped to the PCM range and legitimately exceeds 2^23 on dense
+             * high-bitrate frames (measured 8390219 at 500 kbps/ch on a full-scale
+             * tone). With the old 8388607 threshold every such frame "failed" the
+             * sanity check, re-decoded with the wrong gap, and kept the garbage
+             * because desynced planes often have SMALLER peaks — a systematic
+             * corruption of correct frames. A real wrong-gap desync explodes |M|
+             * far beyond 2^26. */
+            if (forced < 0 && pk > (int64_t)(1 << 26)) {
                 int other = (best_delta == 2) ? 3 : 2;
                 int fr2 = fac_bytes - other; if (fr2 < 0) fr2 = 0;
                 int64_t pk2 = lhdc_dec_mant_plane(coeff, qs, cnt, pl, total_bits,
@@ -1222,8 +1228,17 @@ lhdc_dec_ret_t lhdc_dec_decode_frame(
 
     dec->header_parsed = 1;
 
-    /* Set up band configuration */
-    dec->band_cfg = lhdc_get_band_cfg(dec->header.sample_rate, dec->header.frame_duration_ms);
+    /* Set up band configuration. Selected PER FRAME: at 44.1/48k the encoder
+     * switches segment configs with the per-channel bitrate (<=59 bytes/ch at
+     * 5 ms -> the 24-band LB config; 60..74 -> 480-edge; >=75 -> 400-edge), and
+     * num_sfb changes the SNS side-bit count in the leading section. */
+    {
+        int bc_ch = (dec->header.channels < 1) ? 1 : dec->header.channels;
+        dec->band_cfg = lhdc_get_band_cfg_frame(dec->header.sample_rate,
+                                                dec->header.frame_duration_ms,
+                                                (int)dec->header.frame_bytes / bc_ch);
+        dec->header.band_cfg_idx = (uint8_t)dec->band_cfg->cfg_idx;
+    }
 
     int mdct_size = dec->band_cfg->mdct_size;
     int samples_per_ch = dec->header.samples_per_channel;
