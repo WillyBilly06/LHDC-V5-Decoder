@@ -161,6 +161,40 @@ const lhdc_band_cfg_desc_t *lhdc_get_band_cfg(uint32_t sample_rate, uint8_t fram
     else                  return &lhdc_band_cfgs[LHDC_BAND_CFG_1920];
 }
 
+/*
+ * Per-FRAME band config. The encoder's segment-config selection
+ * (calc_segment_value in the reference source) is keyed on the PER-CHANNEL
+ * bitrate for the 44.1/48k family, not just the sample rate:
+ *   rate = per_ch_bytes * 8 * 10000 / ms   (ms = frame_duration*10, 50 for 5ms)
+ *   rate > 119999 -> segment cfg 480: 32 bands, top edge 480 = _band_off_480_hr
+ *   rate >  95999 -> segment cfg 481: 32 bands, top edge 400 = _band_off_480
+ *   else          -> segment cfg 482: 24 bands, top edge 320 = _band_off_480_lb
+ * (Verified against the reference encoder's constants: SEGMENT_RATE_480_HR=480
+ * — the >119999 case — has offsets ending at 480 = our _hr table, so the old
+ * fixed _hr choice was already correct for the usual negotiated bitrates.)
+ * num_sfb feeds the SNS side-bit count in the leading section, so using a
+ * fixed 32-band config on a <=95999 bps channel (bitrate idx 0/1, <=59
+ * bytes/ch at 5 ms) mis-parses 8 extra SNS bits and desyncs the whole channel
+ * — those streams decoded to near-silence. The 96..120 kbps band (idx 2 at
+ * 48k) gets the 400-edge tables; only upper band boundaries differ there.
+ * 96k/192k always use one config per rate (960/1920), same as before.
+ */
+const lhdc_band_cfg_desc_t *lhdc_get_band_cfg_frame(uint32_t sample_rate,
+                                                    uint8_t frame_duration_ms,
+                                                    int per_ch_bytes)
+{
+    uint16_t spf = lhdc_get_samples_per_frame(sample_rate, frame_duration_ms);
+    if (spf <= 240) {
+        int ms = (frame_duration_ms ? frame_duration_ms : 5) * 10;
+        int bit_rate = per_ch_bytes * 8 * 10000 / ms;
+        if (bit_rate > 119999) return &lhdc_band_cfgs[LHDC_BAND_CFG_480_HR];
+        if (bit_rate > 95999)  return &lhdc_band_cfgs[LHDC_BAND_CFG_480];
+        return &lhdc_band_cfgs[LHDC_BAND_CFG_480_LB];
+    }
+    else if (spf <= 480)  return &lhdc_band_cfgs[LHDC_BAND_CFG_960];
+    else                  return &lhdc_band_cfgs[LHDC_BAND_CFG_1920];
+}
+
 uint16_t lhdc_get_samples_per_frame(uint32_t sample_rate, uint8_t frame_duration_ms)
 {
     return (uint16_t)((uint64_t)sample_rate * frame_duration_ms / 1000);
