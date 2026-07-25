@@ -37,6 +37,11 @@ extern const uint32_t lhdc_bitrate_table_192k[10];
 extern const uint32_t lhdc_band_stop_table[36];
 
 const lhdc_band_cfg_desc_t *lhdc_get_band_cfg(uint32_t sample_rate, uint8_t frame_duration_ms);
+/* Per-frame variant: also keys on the per-channel payload bytes, mirroring the
+ * encoder's bitrate-dependent segment-config selection at 44.1/48 kHz. */
+const lhdc_band_cfg_desc_t *lhdc_get_band_cfg_frame(uint32_t sample_rate,
+                                                    uint8_t frame_duration_ms,
+                                                    int per_ch_bytes);
 uint16_t lhdc_get_samples_per_frame(uint32_t sample_rate, uint8_t frame_duration_ms);
 uint16_t lhdc_get_mdct_size(uint32_t sample_rate, uint8_t frame_duration_ms);
 const uint32_t *lhdc_get_bitrate_table(uint32_t sample_rate);
