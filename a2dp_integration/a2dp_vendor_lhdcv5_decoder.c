@@ -98,6 +98,10 @@ void a2dp_lhdcv5_decoder_cleanup(void) {
     lhdc_entropy_free();
     tA2DP_LHDCV5_DECODER_CB *cb = s_lhdc_cb;
     if (!cb) return;
+    if (cb->decoder) {
+        lhdc_dec_deinit(cb->decoder);   /* split-workspace: free rate-sized work buffers */
+        cb->decoder = NULL;
+    }
     if (cb->workspace) {
         heap_caps_free(cb->workspace);
     }
@@ -163,6 +167,9 @@ void a2dp_lhdcv5_decoder_configure(const uint8_t* p_codec_info) {
         if (!cb->workspace || cb->workspace_size < need) {
             if (cb->workspace) heap_caps_free(cb->workspace);
             cb->workspace = heap_caps_malloc(need, LHDCV5_WS_CAPS);
+            if (cb->workspace) {
+                memset(cb->workspace, 0, need);   /* split-workspace: zero struct so first init sees no garbage tail ptrs */
+            }
             if (!cb->workspace) {
                 cb->workspace_size = 0;
                 LHDCV5_LOGE("configure: cannot allocate %u-byte workspace (largest free %u)",
