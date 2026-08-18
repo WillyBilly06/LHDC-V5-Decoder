@@ -95,19 +95,30 @@ typedef struct {
 typedef struct lhdc_decoder_t lhdc_decoder_t;
 
 /*
- * Get the required workspace size for the decoder at a given rate. The work
- * buffers are rate-sized (mdct_size from the band config), so 48k needs far
- * less than 96k. Pass the negotiated sample_rate and frame_duration (ms).
+ * Get the required workspace size. With the split-workspace design the decoder
+ * allocates its rate-sized work buffers itself, so this only needs room for the
+ * (rate-independent) struct. Pass the negotiated sample_rate and frame_duration
+ * for API compatibility; both are ignored.
  */
 size_t lhdc_dec_get_workspace_size(uint32_t sample_rate, uint8_t frame_duration);
 
 /*
  * Initialize a decoder instance.
- * workspace: pre-allocated buffer of size lhdc_dec_get_workspace_size()
+ * workspace: pre-allocated struct storage, ZERO-INITIALIZED on first use,
+ *            sized lhdc_dec_get_workspace_size() (the decoder mallocs its own
+ *            rate-sized work buffers, each <= ~7.7KB, internal DRAM on ESP32).
  * config:    decoder configuration (may be NULL for auto-detect from bitstream)
- * Returns a decoder handle, or NULL on failure.
+ * Returns a decoder handle, or NULL on failure (caller should memset the
+ * workspace to zero before retrying, so a re-init will not free garbage).
  */
 lhdc_decoder_t *lhdc_dec_init(void *workspace, const lhdc_dec_config_t *config);
+
+/*
+ * Destroy a decoder instance: frees the rate-sized work buffers that the
+ * decoder allocated itself (split-workspace design). The caller still owns
+ * the `workspace` buffer (struct storage) and frees it separately.
+ */
+void lhdc_dec_deinit(lhdc_decoder_t *dec);
 
 /*
  * Decode one frame.

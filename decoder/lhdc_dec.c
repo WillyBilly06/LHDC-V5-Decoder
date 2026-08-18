@@ -8,6 +8,22 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+
+/* Split-workspace allocation (2026-08-18, esp32-d0wd): each rate-sized work
+ * buffer is allocated independently instead of being carved from one contiguous
+ * 32.5KB slab. Largest single sub-buffer is mdct_out = M*4B (7680B at 192k,
+ * 3840B at 96k) - a few KB is always findable even when the internal heap is
+ * fragmented, so LHDC can never be blocked by lack of a big contiguous block.
+ * Buffers must stay in internal DRAM on ESP32 (IMDCT hot buffers), mirroring
+ * the legacy workspace caps. On the host test build plain malloc/free is used. */
+#ifndef LHDC_HOST_BUILD
+#include "esp_heap_caps.h"
+#define LHDC_DEC_MALLOC(n) heap_caps_malloc((n), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
+#define LHDC_DEC_FREE(p)   heap_caps_free(p)
+#else
+#define LHDC_DEC_MALLOC(n) malloc(n)
+#define LHDC_DEC_FREE(p)   free(p)
+#endif
 #include <stdio.h>   /* snprintf used in g_lhdc_trace diagnostics */
 #if defined(LHDC_HOST_BUILD)
   #define ESP_LOGI(tag, ...) do { printf("[I]" tag ": " __VA_ARGS__); printf("\n"); } while (0)
@@ -1091,27 +1107,32 @@ static lhdc_dec_ret_t lhdc_dec_decode_channel_autosel(lhdc_decoder_t *dec,
 
 /* Public API */
 
-/* Rate-sized tail layout (placed right after the struct): all 4-byte arrays
- * first (natural alignment), then the byte arrays. Mirrors lhdc_dec_carve(). */
-static size_t lhdc_dec_tail_bytes(int mdct_size)
+/* Free independently-allocated rate-sized work buffers (split-workspace).
+ * Guarded by alloc_mdct_size: caller must zero-initialize workspace on first
+ * use so this no-ops before the first carve. */
+static void lhdc_dec_free_tails(lhdc_decoder_t *dec)
 {
-    int M = mdct_size, H = mdct_size / 2;
-    size_t b = 0;
-    b += (size_t)H * sizeof(float);                       /* w_buf (mdct_in[H spectrum]/ch_pcm[H pcm]) */
-    b += (size_t)M * sizeof(float);                       /* u_buf (mdct_out[M]/quant[H]) */
-    b += (size_t)LHDC_DEC_MAX_CHANNELS * (size_t)H * sizeof(float); /* overlap_buf */
-    b += (size_t)H * sizeof(float);                       /* pcm_mid */
-    b += (size_t)H * sizeof(float);                       /* ov_save (clip-recovery snapshot) */
-    /* Entropy scratch sized to the ACTUAL bounds (was mdct_size / 3*mdct_size/2,
-     * ~2x oversized): ent_s1 is indexed only up to num_coeffs (= mdct_size/2 = H)
-     * one-per-coeff; ent_s2 (Rice pass-2 ternary) is filled only up to
-     * min(count*2, cap) <= num_coeffs*2 = mdct_size = M. Verified vs the decoder's
-     * actual indexing (s1[i<count<=num_coeffs], s2 lazy_cap=count*2). */
-    b += (size_t)H;                                       /* ent_s1 (num_coeffs) */
-    b += (size_t)M;                                       /* ent_s2 (num_coeffs*2) */
-    return b;
+    if (!dec || dec->alloc_mdct_size == 0) {
+        return;
+    }
+#define LHDC_DEC_FREET(f) do { if (dec->f) { LHDC_DEC_FREE(dec->f); dec->f = NULL; } } while (0)
+    LHDC_DEC_FREET(mdct_in);
+    LHDC_DEC_FREET(mdct_out);
+    LHDC_DEC_FREET(overlap_buf[0]);
+    LHDC_DEC_FREET(overlap_buf[1]);
+    LHDC_DEC_FREET(pcm_mid);
+    LHDC_DEC_FREET(ov_save);
+    LHDC_DEC_FREET(ent_s1);
+    LHDC_DEC_FREET(ent_s2);
+    dec->alloc_mdct_size = 0;
+#undef LHDC_DEC_FREET
 }
 
+/* Allocate the rate-sized work buffers individually and point the decoder
+ * work pointers at them (preserving mdct_in/ch_pcm and mdct_out/quant_spectrum
+ * aliasing). Largest single allocation: mdct_out = M*4B (7.7KB max) - always
+ * allocatable even on a fragmented internal heap. Returns false and frees
+ * everything on failure (alloc_mdct_size stays 0 so a retry reallocs). */
 static int lhdc_dec_mdct_size(uint32_t sr, uint8_t dur)
 {
     const lhdc_band_cfg_desc_t *bc = lhdc_get_band_cfg(sr, dur ? dur : 5);
@@ -1120,30 +1141,39 @@ static int lhdc_dec_mdct_size(uint32_t sr, uint8_t dur)
     return M;
 }
 
-/* Carve the tail buffers from `base` for the given mdct_size and point the
- * decoder's work pointers at them (preserving the mdct_in/ch_pcm and
- * mdct_out/quant_spectrum aliasing). Zeroes the overlap buffers. */
-static void lhdc_dec_carve(lhdc_decoder_t *dec, uint8_t *base, int M)
+static bool lhdc_dec_carve_alloc(lhdc_decoder_t *dec, int M)
 {
     int H = M / 2;
-    uint8_t *p = base;
-    dec->mdct_in        = (float *)p;   p += (size_t)H * sizeof(float);
-    dec->ch_pcm         = dec->mdct_in;                 /* alias (H: spectrum=mdct_size/2, pcm=samples/ch) */
-    dec->mdct_out       = (float *)p;   p += (size_t)M * sizeof(float);
+    dec->mdct_in        = (float *)LHDC_DEC_MALLOC((size_t)H * sizeof(float));
+    dec->mdct_out       = (float *)LHDC_DEC_MALLOC((size_t)M * sizeof(float));
+    dec->overlap_buf[0] = (float *)LHDC_DEC_MALLOC((size_t)H * sizeof(float));
+    dec->overlap_buf[1] = (float *)LHDC_DEC_MALLOC((size_t)H * sizeof(float));
+    dec->pcm_mid        = (float *)LHDC_DEC_MALLOC((size_t)H * sizeof(float));
+    dec->ov_save        = (float *)LHDC_DEC_MALLOC((size_t)H * sizeof(float));
+    dec->ent_s1         = (uint8_t *)LHDC_DEC_MALLOC((size_t)H);
+    dec->ent_s2         = (uint8_t *)LHDC_DEC_MALLOC((size_t)M);
+    dec->ch_pcm         = dec->mdct_in;                 /* alias */
     dec->quant_spectrum = (int32_t *)dec->mdct_out;     /* alias */
-    dec->overlap_buf[0] = (float *)p;   p += (size_t)H * sizeof(float);
-    dec->overlap_buf[1] = (float *)p;   p += (size_t)H * sizeof(float);
-    dec->pcm_mid        = (float *)p;   p += (size_t)H * sizeof(float);
-    dec->ov_save        = (float *)p;   p += (size_t)H * sizeof(float);
-    dec->ent_s1         = p;            p += (size_t)H;   /* num_coeffs */
-    dec->ent_s2         = p;            p += (size_t)M;   /* num_coeffs*2 */
+    if (!dec->mdct_in || !dec->mdct_out || !dec->overlap_buf[0] || !dec->overlap_buf[1]
+        || !dec->pcm_mid || !dec->ov_save || !dec->ent_s1 || !dec->ent_s2) {
+        lhdc_dec_free_tails(dec);
+        return false;
+    }
+    /* overlap_buf[0..1] are now separate allocations (split-workspace): zero each.
+     * (The old contiguous slab let one memset cover both; that would overflow
+     * buffer[0] into heap metadata here -> tlsf malloc corruption crash.) */
+    memset(dec->overlap_buf[0], 0, (size_t)H * sizeof(float));
+    memset(dec->overlap_buf[1], 0, (size_t)H * sizeof(float));
     dec->alloc_mdct_size = M;
-    memset(dec->overlap_buf[0], 0, (size_t)LHDC_DEC_MAX_CHANNELS * (size_t)H * sizeof(float));
+    return true;
 }
-
 size_t lhdc_dec_get_workspace_size(uint32_t sample_rate, uint8_t frame_duration)
 {
-    return sizeof(lhdc_decoder_t) + lhdc_dec_tail_bytes(lhdc_dec_mdct_size(sample_rate, frame_duration));
+    (void)sample_rate; (void)frame_duration;
+    /* Split-workspace: rate-sized work buffers are allocated by the decoder
+     * itself (see lhdc_dec_init); the caller only provides storage for the
+     * rate-independent struct (which embeds payload_buf/fac_buf). */
+    return sizeof(lhdc_decoder_t);
 }
 
 lhdc_decoder_t *lhdc_dec_init(void *workspace, const lhdc_dec_config_t *config)
@@ -1153,6 +1183,11 @@ lhdc_decoder_t *lhdc_dec_init(void *workspace, const lhdc_dec_config_t *config)
     if (!dec) {
         return NULL;
     }
+
+    /* Split-workspace: free the previous call's rate-sized work buffers BEFORE
+     * memset zeroes their pointers (otherwise they leak on a rate change). On
+     * first use the caller zero-initialized the workspace so this no-ops. */
+    lhdc_dec_free_tails(dec);
 
     memset(dec, 0, sizeof(*dec));
 
@@ -1168,16 +1203,16 @@ lhdc_decoder_t *lhdc_dec_init(void *workspace, const lhdc_dec_config_t *config)
         dec->config.lossless_enable = 0;
     }
 
-    /* Carve the rate-sized work buffers from the tail (immediately after the
-     * struct). The caller sized the workspace with lhdc_dec_get_workspace_size()
-     * for this same sample_rate/frame_duration. */
+    /* Split-workspace: allocate each rate-sized work buffer independently
+     * (largest single ~7.7KB) - no big contiguous slab needed, immune to heap
+     * fragmentation. */
     {
         int M = lhdc_dec_mdct_size(dec->config.sample_rate, dec->config.frame_duration);
-        lhdc_dec_carve(dec, (uint8_t *)workspace + sizeof(lhdc_decoder_t), M);
-        /* Build this rate's IMDCT tables now and, crucially, FREE the 96k
-         * (N=960) fast tables (~15 KB) when this rate is not 96k. Otherwise they
-         * linger on the heap after a 96k->48k switch (transform() only inits when
-         * the fast path isn't built yet, so it never frees them on downswitch). */
+        if (!lhdc_dec_carve_alloc(dec, M)) {
+            return NULL;
+        }
+        /* Build this rate's IMDCT tables now and, on a rate change, free the
+         * previous rate's fast tables (see transform()). */
         lhdc_imdct_init(M);
     }
 
@@ -1440,6 +1475,11 @@ lhdc_dec_ret_t lhdc_dec_decode_frame(
     }
 
     return LHDC_DEC_OK;
+}
+
+void lhdc_dec_deinit(lhdc_decoder_t *dec)
+{
+    lhdc_dec_free_tails(dec);
 }
 
 void lhdc_dec_flush(lhdc_decoder_t *dec)
