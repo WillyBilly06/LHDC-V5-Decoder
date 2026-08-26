@@ -16,6 +16,17 @@
 #define LHDC_HOT          IRAM_ATTR
 #endif
 
+/* Inline control for the range coder. fac_decode + fac_model_update run once per
+ * decoded symbol (~1M/s at 192k/1000k), so they must fold into the caller's loop:
+ * an out-of-line Xtensa windowed call (entry/retw + register window rotation)
+ * costs more than the symbol decode itself. fac_model_rescale is the opposite --
+ * it fires roughly once per 20 symbols, and inlining its three call sites is what
+ * pushed fac_decode past GCC's size heuristic and out of line in the first place,
+ * so it is pinned out-of-line (still IRAM). */
+#define LHDC_ALWAYS_INLINE __attribute__((always_inline)) inline
+#define LHDC_NOINLINE      __attribute__((noinline))
+
+
 /*
  * LHDC V5 entropy decoder — reverse-engineered and validated bit-exact against
  * the real liblhdcv5.so encoder (range coder 50/50, Rice 20000/20000 round-trip,
@@ -83,20 +94,30 @@ void lhdc_entropy_alloc_internal(void)
 void lhdc_entropy_alloc(void) { /* no-op: models are static .bss */ }
 void lhdc_entropy_free(void)  { /* no-op: models are static .bss */ }
 
-static LHDC_HOT void fac_model_rescale(fac_model_t *m)
+/* The FAC alphabet is always ternary (m->n is only ever assigned FAC_NSYM), so
+ * the model loops are written out for n == 3: no trip counts, no m->n reload,
+ * and the cumulative freqs stay in registers.
+ *
+ * The 64-bit product is also gone. cum[i] <= total and scale = 0x80000000/total
+ * (floor), so cum[i]*scale <= total*floor(0x80000000/total) <= 0x80000000 --
+ * it cannot overflow 32 bits. Verified by differential test over 20M decoded
+ * symbols (max product observed: exactly 0x80000000). On Xtensa that turns a
+ * mull/muluh/shift sequence into a single mull per entry. */
+_Static_assert(FAC_NSYM == 3, "fac model fast paths assume a ternary alphabet");
+
+static LHDC_HOT LHDC_NOINLINE void fac_model_rescale(fac_model_t *m)
 {
-    uint32_t cum[FAC_NSYM + 1];
-    cum[0] = 0;
-    for (int i = 0; i < m->n; i++) {
-        cum[i + 1] = cum[i] + m->freq[i];
-        m->thresh[i] = m->freq[i] + (m->freq[i] >> 5);
-    }
-    uint32_t total = cum[m->n];
-    uint32_t scale = (uint32_t)(0x80000000u / total);
+    const uint32_t f0 = m->freq[0], f1 = m->freq[1], f2 = m->freq[2];
+    m->thresh[0] = f0 + (f0 >> 5);
+    m->thresh[1] = f1 + (f1 >> 5);
+    m->thresh[2] = f2 + (f2 >> 5);
+
+    const uint32_t c1 = f0, c2 = f0 + f1, c3 = c2 + f2;   /* running cumulative */
+    const uint32_t scale = 0x80000000u / c3;              /* c3 = total > 0 */
     m->cum[0] = 0;
-    for (int i = 1; i <= m->n; i++) {
-        m->cum[i] = (uint32_t)(((uint64_t)cum[i] * scale) >> 16);
-    }
+    m->cum[1] = (c1 * scale) >> 16;
+    m->cum[2] = (c2 * scale) >> 16;
+    m->cum[3] = (c3 * scale) >> 16;
 }
 
 static void fac_model_init(fac_model_t *m, const uint32_t *init_freq, int window)
@@ -112,21 +133,26 @@ static void fac_model_init(fac_model_t *m, const uint32_t *init_freq, int window
     fac_model_rescale(m);
 }
 
-static LHDC_HOT void fac_model_update(fac_model_t *m, int sym)
+/* Same state transition as before, with the history write hoisted above the
+ * freq update: fac_model_rescale touches neither hist nor pos/count, so the
+ * reorder is observationally identical (checked symbol-by-symbol, including the
+ * full history buffer, against the previous version over 20M symbols) and it
+ * frees the compiler to keep `pos` in a register across the branch. */
+static LHDC_HOT LHDC_ALWAYS_INLINE void fac_model_update(fac_model_t *m, int sym)
 {
+    uint32_t *const freq = m->freq;
     if (m->count < m->window) {
-        m->freq[sym]++;
-        if (m->freq[sym] >= m->thresh[sym]) fac_model_rescale(m);
         m->hist[m->count] = (uint8_t)sym;
         m->count++;
+        if (++freq[sym] >= m->thresh[sym]) fac_model_rescale(m);
     } else {
-        int old = m->hist[m->pos];
-        if (m->freq[old] >= 2) m->freq[old]--;
-        m->freq[sym]++;
-        if (m->freq[sym] >= m->thresh[sym]) fac_model_rescale(m);
-        m->hist[m->pos] = (uint8_t)sym;
-        m->pos++;
-        if (m->pos >= m->window) m->pos = 0;
+        int pos = m->pos;
+        const int old = m->hist[pos];
+        if (freq[old] >= 2) freq[old]--;
+        m->hist[pos] = (uint8_t)sym;
+        if (++pos >= m->window) pos = 0;
+        m->pos = pos;
+        if (++freq[sym] >= m->thresh[sym]) fac_model_rescale(m);
     }
 }
 
@@ -139,7 +165,7 @@ typedef struct {
     uint32_t       code;
 } fac_dec_t;
 
-static LHDC_HOT uint8_t fac_byte(fac_dec_t *d)
+static LHDC_HOT LHDC_ALWAYS_INLINE uint8_t fac_byte(fac_dec_t *d)
 {
     uint8_t b = (d->p < d->len) ? d->data[d->p] : 0;
     d->p++;
@@ -156,32 +182,54 @@ static void fac_dec_init(fac_dec_t *d, const uint8_t *data, int len)
     for (int i = 0; i < 4; i++) d->code = (d->code << 8) | fac_byte(d);
 }
 
-static LHDC_HOT int fac_decode(fac_dec_t *d, fac_model_t *m)
+static LHDC_HOT LHDC_ALWAYS_INLINE int fac_decode(fac_dec_t *d, fac_model_t *m)
 {
 #if defined(LHDC_HOST_BUILD)
     extern volatile int g_lhdc_trace; extern int g_fdc;   /* reset per-channel by the entropy fn */
     uint32_t dbg_range=d->range, dbg_code=d->code;
     uint32_t dbg_cum1=m->cum[1], dbg_cum2=m->cum[2], dbg_f0=m->freq[0],dbg_f1=m->freq[1],dbg_f2=m->freq[2],dbg_cnt=m->count;
 #endif
-    uint32_t r = d->range >> FAC_TOTAL_BITS;
-    /* Divide-free symbol search. The ARM reference computed `target = code / r`
-     * per symbol; Xtensa LX6 has no fast integer divide (~30+ cycle software
-     * call) whereas it has a fast 32-bit multiply. Use the integer identity
-     * floor(code/r) >= c  <=>  code >= r*c  (c>=0, r>0) to compare r*cum[] to
-     * code directly. m->n is always 3 (ternary FAC), so this is <=2 multiplies
-     * replacing one divide per decoded symbol. Bit-IDENTICAL to the old
-     * target+clamp path: the `target>=FAC_TOTAL -> FAC_TOTAL-1` clamp is
-     * subsumed by the `sym+1 < m->n` loop bound (when code/r overshoots, the
-     * scan still stops at the last symbol n-1). No overflow: r*cum[sym+1] <=
-     * r*FAC_TOTAL = (range>>15)<<15 <= range < 2^32. */
-    int sym = 0;
-    while (sym + 1 < m->n && r * m->cum[sym + 1] <= d->code) sym++;
-    d->code -= r * m->cum[sym];
-    d->range = r * (m->cum[sym + 1] - m->cum[sym]);
-    while ((d->range >> 24) == 0) {
-        d->code = (d->code << 8) | fac_byte(d);
-        d->range <<= 8;
+    /* Divide-free, branch-flat ternary symbol search. The ARM reference computed
+     * `target = code / r` per symbol; Xtensa LX6's divide is a ~30-cycle
+     * non-pipelined instruction whereas its 32-bit multiply is single-cycle, so
+     * use the integer identity floor(code/r) >= c  <=>  code >= r*c (c>=0, r>0)
+     * and compare r*cum[] against code directly. Bit-IDENTICAL to the old
+     * target+clamp path: the `target >= FAC_TOTAL -> FAC_TOTAL-1` clamp is
+     * subsumed by stopping at the last symbol. No overflow: r*cum[k] <=
+     * r*FAC_TOTAL = (range>>15)<<15 <= range < 2^32.
+     *
+     * Written out for the ternary alphabet instead of looping on m->n: that
+     * drops the trip-count reload and the loop branch, and cum[0] is always 0
+     * so symbol 0 needs no subtract at all. The decoder state is pulled into
+     * locals for the duration so the renormalize loop works on registers
+     * instead of re-reading the struct through a pointer each iteration. */
+    uint32_t range = d->range, code = d->code;
+    const uint32_t r = range >> FAC_TOTAL_BITS;
+    const uint32_t c1 = m->cum[1];
+    uint32_t lo, hi;
+    int sym;
+    if (r * c1 > code) {
+        sym = 0; lo = 0;  hi = c1;
+    } else {
+        const uint32_t c2 = m->cum[2];
+        if (r * c2 > code) { sym = 1; lo = c1; hi = c2; }
+        else               { sym = 2; lo = c2; hi = m->cum[3]; }
     }
+    code  -= r * lo;
+    range  = r * (hi - lo);
+    if (range < (1u << 24)) {                 /* renormalize (was `(range>>24)==0`) */
+        const uint8_t *const data = d->data;
+        int p = d->p;
+        const int len = d->len;
+        do {
+            code = (code << 8) | ((p < len) ? data[p] : 0);
+            p++;
+            range <<= 8;
+        } while (range < (1u << 24));
+        d->p = p;
+    }
+    d->range = range;
+    d->code = code;
     fac_model_update(m, sym);
 #if defined(LHDC_HOST_BUILD)
     if (g_lhdc_trace > 0) {
@@ -196,116 +244,112 @@ static LHDC_HOT int fac_decode(fac_dec_t *d, fac_model_t *m)
 }
 
 /* --- Rice quotient inverse (mirrors rice_dec.py, validated) --- */
-__attribute__((unused))
-static LHDC_HOT int rice_read_quotient(const uint8_t *s2, int n, int *jp)
+
+/*
+ * Lazily-decoded pass-2 symbol stream.
+ *
+ * The old flow decoded the pass-2 stream THREE times per channel:
+ *   1. an eager fill of min(2*count, cap) symbols  (1920 at 192k),
+ *   2. the Rice inverse, which consumes only `s2_used` of them (typically a
+ *      small fraction),
+ *   3. a full re-decode of s2_used symbols from a re-initialized model, purely
+ *      to recover the byte position where the mantissa plane starts.
+ * At 192k that is 960 (s1) + 1920 (eager) + s2_used symbols per channel, of
+ * which the 1920 are mostly thrown away. The range coder is serial and is the
+ * single largest CPU consumer in the decoder, so this dominated the 192k
+ * budget on a chip without ARM's headroom.
+ *
+ * s2_at() decodes symbols on demand into the SAME array, one at a time, under
+ * the SAME guard the eager loop used (`len < cap && d->p <= d->len`). That
+ * makes the produced prefix identical to the old eager fill symbol-for-symbol,
+ * and s2_at() returns -1 exactly where the old code would have read past
+ * `s2len` -- so the Rice inverse below is a literal transcription of the array
+ * version with `j < n && s2[j]` rewritten as `s2_at(j)`.
+ *
+ * save_p/save_range snapshot the decoder state BEFORE the most recently decoded
+ * symbol, which is what removes pass 3: after the Rice inverse consumes
+ * s2_used symbols, the state after exactly s2_used symbols is either the live
+ * one (nothing was read ahead) or the snapshot (one lookahead symbol was
+ * decoded but not consumed). See s2_state_after().
+ */
+typedef struct {
+    fac_dec_t   *d;
+    fac_model_t *m;
+    uint8_t     *s2;         /* backing array (same scratch as before) */
+    int          len;        /* symbols decoded so far */
+    int          cap;        /* == the old lazy_cap */
+    int          eos;        /* fill guard failed; len is final */
+    int          save_idx;   /* index of the last decoded symbol */
+    int          save_p;     /* d->p before that symbol */
+    uint32_t     save_range; /* d->range before that symbol */
+} s2_lazy_t;
+
+/* s2[i], or -1 when i is past the end of what the stream can produce. */
+static LHDC_HOT LHDC_ALWAYS_INLINE int s2_at(s2_lazy_t *z, int i)
+{
+    while (i >= z->len) {
+        if (z->eos) return -1;
+        if (z->len >= z->cap || z->d->p > z->d->len) { z->eos = 1; return -1; }
+        z->save_idx   = z->len;
+        z->save_p     = z->d->p;
+        z->save_range = z->d->range;
+        z->s2[z->len++] = (uint8_t)fac_decode(z->d, z->m);
+    }
+    return z->s2[i];
+}
+
+/* Decoder state (byte position + range) after exactly `used` pass-2 symbols --
+ * what the old pass-3 re-decode computed. */
+static void s2_state_after(s2_lazy_t *z, int used, int *p_out, uint32_t *range_out)
+{
+    if (used < z->len) {
+        /* Only case: one lookahead symbol was decoded but not consumed. */
+        *p_out = z->save_p; *range_out = z->save_range;
+        (void)z->save_idx;   /* == used by construction */
+    } else {
+        /* The Rice inverse walked past what the stream produced (end of input).
+         * The old code re-decoded `used` symbols regardless, so match it. */
+        for (int i = z->len; i < used; i++) (void)fac_decode(z->d, z->m);
+        *p_out = z->d->p; *range_out = z->d->range;
+    }
+}
+
+static LHDC_HOT int rice_read_quotient(s2_lazy_t *z, int *jp)
 {
     int j = *jp;
-    if (j < n && s2[j] == 2) {
+    if (s2_at(z, j) == 2) {
         uint32_t low = 0;
         int shift = 0;
-        while (j < n && s2[j] == 2) {
+        while (s2_at(z, j) == 2) {
             j++;
-            int b1 = (j < n) ? s2[j] : 0; j++;
-            int b0 = (j < n) ? s2[j] : 0; j++;
+            int v1 = s2_at(z, j); int b1 = (v1 < 0) ? 0 : v1; j++;
+            int v0 = s2_at(z, j); int b0 = (v0 < 0) ? 0 : v0; j++;
             low |= (uint32_t)(((b1 << 1) | b0)) << shift;
             shift += 2;
         }
         int ones = 0;
-        while (j < n && s2[j] == 1) { ones++; j++; }
-        if (j < n && s2[j] == 0) j++;
+        while (s2_at(z, j) == 1) { ones++; j++; }
+        if (s2_at(z, j) == 0) j++;
         *jp = j;
         return (int)(low | ((uint32_t)(ones + 1) << shift));
     }
     int ones = 0;
-    while (ones < 3 && j < n && s2[j] == 1) { ones++; j++; }
+    while (ones < 3 && s2_at(z, j) == 1) { ones++; j++; }
     if (ones == 3) { *jp = j; return 3; }
-    if (j < n && s2[j] == 0) j++;
+    if (s2_at(z, j) == 0) j++;
     *jp = j;
     return ones;
 }
 
 /*
- * On-demand pass-2 stream: decodes s2 symbols from the range coder lazily with a
- * 1-symbol lookahead, mirroring the array peek/consume semantics EXACTLY (s2[j]
- * -> peek, j++ -> consume). This avoids pre-decoding a large fixed bound AND the
- * separate re-decode to find the byte position: because each consumed symbol is
- * decoded exactly once and `save_p/save_range` snapshot the reader state BEFORE
- * the current (possibly unconsumed) lookahead symbol, the precise byte position
- * after the consumed symbols is available directly. Result is bit-identical to
- * the array path but ~4x fewer symbol decodes (fixes the real-time stutter).
- */
-typedef struct { fac_dec_t *d; fac_model_t *m; int has; int val; int save_p; uint32_t save_range; int used; } s2_stream_t;
-static int s2_peek(s2_stream_t *s) {
-    if (!s->has) { s->save_p = s->d->p; s->save_range = s->d->range;
-                   s->val = fac_decode(s->d, s->m); s->has = 1; }
-    return s->val;
-}
-static void s2_consume(s2_stream_t *s) { s->has = 0; s->used++; }
-
-static int rice_read_quotient_s(s2_stream_t *s)
-{
-    if (s2_peek(s) == 2) {
-        uint32_t low = 0;
-        int shift = 0;
-        while (s2_peek(s) == 2) {
-            s2_consume(s);
-            int b1 = s2_peek(s); s2_consume(s);
-            int b0 = s2_peek(s); s2_consume(s);
-            low |= (uint32_t)(((b1 << 1) | b0)) << shift;
-            shift += 2;
-        }
-        int ones = 0;
-        while (s2_peek(s) == 1) { ones++; s2_consume(s); }
-        if (s2_peek(s) == 0) s2_consume(s);
-        return (int)(low | ((uint32_t)(ones + 1) << shift));
-    }
-    int ones = 0;
-    while (ones < 3 && s2_peek(s) == 1) { ones++; s2_consume(s); }
-    if (ones == 3) return 3;
-    if (s2_peek(s) == 0) s2_consume(s);
-    return ones;
-}
-
-/* On-demand variant of rice_decode_coeffs_used: identical logic, pulls s2 from
- * the live range coder. After return, *fac_p / *fac_range give the reader state
- * after exactly (count + s2_used) symbols (the mantissa-plane start + leftover). */
-static void rice_decode_coeffs_used_od(const uint8_t *s1, s2_stream_t *s,
-                                       int count, int split, int32_t *coeff,
-                                       int *s2_used, int *fac_p, uint32_t *fac_range)
-{
-    int pivot = count - split;
-    if (pivot < 0) pivot = 0;
-    int run = 0;
-    for (int i = 0; i < count; i++) if (s1[i] == 2) run = i;
-    int pivot2 = (run < pivot) ? count : run;
-
-    for (int i = 0; i < count; i++) {
-        int sv = s1[i];
-        if (i <= pivot2) {
-            if (sv == 2) { int q = rice_read_quotient_s(s); coeff[i] = q + 2; }
-            else         { coeff[i] = sv; }
-        } else {
-            int q = rice_read_quotient_s(s); coeff[i] = (q << 1) | sv;
-        }
-    }
-    if (s2_used) *s2_used = s->used;
-    /* If a lookahead symbol is buffered (decoded but not consumed), the reader
-     * state before it (save_p/save_range) is the position after the consumed
-     * symbols; otherwise the live d->p/d->range already are. */
-    if (s->has) { if (fac_p) *fac_p = s->save_p;  if (fac_range) *fac_range = s->save_range; }
-    else        { if (fac_p) *fac_p = s->d->p;    if (fac_range) *fac_range = s->d->range; }
-}
-
-/*
  * Decode `count` quantized |coeff| values from the two ternary streams.
- *   s1: pass-1 plane (length count), s2: pass-2 quotient stream.
+ *   s1: pass-1 plane (length count), z: lazy pass-2 quotient stream.
  *   pivot = max(count - split, 0); run = last index whose s1 symbol == 2;
  *   pivot2 = (run < pivot) ? count : run.
  *   i <= pivot2: s1==2 -> coeff = q+2 ; else coeff = s1[i] (coeff<2).
  *   i  > pivot2: coeff = (q<<1) | s1[i]  (s1[i] is the LSB).
  */
-__attribute__((unused))
-static LHDC_HOT void rice_decode_coeffs_used(const uint8_t *s1, const uint8_t *s2, int s2len,
+static LHDC_HOT void rice_decode_coeffs_used(const uint8_t *s1, s2_lazy_t *z,
                                     int count, int split, int32_t *coeff,
                                     int *s2_used)
 {
@@ -320,13 +364,13 @@ static LHDC_HOT void rice_decode_coeffs_used(const uint8_t *s1, const uint8_t *s
         int s = s1[i];
         if (i <= pivot2) {
             if (s == 2) {
-                int q = rice_read_quotient(s2, s2len, &j);
+                int q = rice_read_quotient(z, &j);
                 coeff[i] = q + 2;
             } else {
                 coeff[i] = s;
             }
         } else {
-            int q = rice_read_quotient(s2, s2len, &j);
+            int q = rice_read_quotient(z, &j);
             coeff[i] = (q << 1) | s;
         }
     }
@@ -381,47 +425,52 @@ lhdc_dec_ret_t lhdc_entropy_decode_spectrum_ex2(int32_t *quant_spectrum,
 
     fac_model_init(pm1, FAC_FQ1, ma_win1 > 0 ? ma_win1 : 256);
     for (int i = 0; i < count; i++) s1[i] = (uint8_t)fac_decode(&d, pm1);
-    fac_dec_t d_after_s1 = d;   /* snapshot: byte-pos pass resumes here, no s1 re-decode */
 
     fac_model_init(pm2, FAC_FQ2, ma_win2 > 0 ? ma_win2 : 256);
-    int s2len = 0;
     int s2cap = scratch_s2_cap;
     /* The Rice inverse never needs > ~2 pass-2 symbols per coeff; 2*count is a safe
      * ceiling (verified: capping here vs decoding to end-of-input does not change
-     * the decoded result on the full stress corpus). Saves ~1/3 of entropy time. */
+     * the decoded result on the full stress corpus). The symbols are now decoded
+     * ON DEMAND under this same bound instead of being pre-decoded in full: the
+     * Rice inverse consumes only a fraction of them, so the eager fill was the
+     * decoder's single largest block of wasted work. */
     int lazy_cap = (count * 2 < s2cap) ? count * 2 : s2cap;
-    while (s2len < lazy_cap && d.p <= d.len) s2[s2len++] = (uint8_t)fac_decode(&d, pm2);
+    s2_lazy_t z;
+    z.d = &d; z.m = pm2; z.s2 = s2;
+    z.len = 0; z.cap = lazy_cap; z.eos = 0;
+    z.save_idx = 0; z.save_p = d.p; z.save_range = d.range;
 
 #if defined(LHDC_HOST_BUILD)
     { extern volatile int g_lhdc_trace;
       if (g_lhdc_trace > 0) {
-        printf("[ENT] count=%d split=%d ma_win1=%d ma_win2=%d nb=%d s2len=%d\n",
-               count, split, ma_win1, ma_win2, nb, s2len);
+        printf("[ENT] count=%d split=%d ma_win1=%d ma_win2=%d nb=%d (s2 lazy)\n",
+               count, split, ma_win1, ma_win2, nb);
         printf("[ENT] s1full:");
         for (int i = 0; i < count; i++) printf(" %d", s1[i]);
-        printf("\n[ENT] s2full:");
-        for (int i = 0; i < s2len && i < 400; i++) printf(" %d", s2[i]);
         printf("\n");
       } }
 #endif
 
     memset(quant_spectrum, 0, num_coeffs * sizeof(int32_t));
     int s2_used = 0;
-    rice_decode_coeffs_used(s1, s2, s2len, count, split, quant_spectrum, &s2_used);
+    rice_decode_coeffs_used(s1, &z, count, split, quant_spectrum, &s2_used);
 
     if (fac_bytes_out) {
-        fac_dec_t d2 = d_after_s1;   /* resume right after s1 (deterministic: same as
-                                      * re-decoding count s1 symbols from the start) */
-        fac_model_init(pm2, FAC_FQ2, ma_win2 > 0 ? ma_win2 : 256);
-        for (int i = 0; i < s2_used; i++) (void)fac_decode(&d2, pm2);
-        int consumed = d2.p;
+        /* Byte position after exactly s2_used pass-2 symbols. The old code got
+         * this by re-initializing the model and re-decoding s2_used symbols from
+         * a snapshot taken after s1; the lazy stream already holds that state (or
+         * the snapshot taken just before its single lookahead symbol), so the
+         * whole third pass over the range coder is gone. */
+        int consumed = 0;
+        uint32_t final_range = 0;
+        s2_state_after(&z, s2_used, &consumed, &final_range);
         if (consumed < 0) consumed = 0;
         *fac_bytes_out = consumed;            /* raw bytes pulled */
-        g_fac_final_range = d2.range;         /* leftover rule applied in lhdc_dec.c */
+        g_fac_final_range = final_range;      /* leftover rule applied in lhdc_dec.c */
 #if defined(LHDC_HOST_BUILD)
         if (getenv("LHDC_LEFTOVER_LOG"))
             printf("[LEFTOVER] consumed=%d range=%08x s2_used=%d rule=%d\n",
-                   consumed, d2.range, s2_used, (d2.range <= 0x2000000u) ? 2 : 3);
+                   consumed, final_range, s2_used, (final_range <= 0x2000000u) ? 2 : 3);
 #endif
     }
     return LHDC_DEC_OK;
