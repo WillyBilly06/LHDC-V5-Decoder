@@ -275,41 +275,67 @@ static LHDC_HOT LHDC_ALWAYS_INLINE int fac_decode(fac_dec_t *d, fac_model_t *m)
 typedef struct {
     fac_dec_t   *d;
     fac_model_t *m;
-    uint8_t     *s2;         /* backing array (same scratch as before) */
-    int          len;        /* symbols decoded so far */
-    int          cap;        /* == the old lazy_cap */
-    int          eos;        /* fill guard failed; len is final */
-    int          save_idx;   /* index of the last decoded symbol */
-    int          save_p;     /* d->p before that symbol */
-    uint32_t     save_range; /* d->range before that symbol */
+    int          cur_idx;    /* index of the symbol held in cur_val; -1 = none yet */
+    int          cur_val;    /* the newest decoded symbol */
+    int          produced;   /* symbols decoded from the range coder */
+    int          hard_cap;   /* runaway guard, see lhdc_entropy_decode_spectrum_ex2 */
+    int          eos;        /* stream exhausted; no more symbols will be produced */
+    int          save_p;     /* d->p before cur_val was decoded */
+    uint32_t     save_range; /* d->range before cur_val was decoded */
 } s2_lazy_t;
 
-/* s2[i], or -1 when i is past the end of what the stream can produce. */
+#if defined(LHDC_HOST_BUILD)
+/* Why a pass-2 stream stopped, for host harnesses. cap_hits > 0 means the
+ * runaway guard fired, which should never happen on a well-formed frame; it is
+ * how the truncation bug this stream used to have was found. */
+int g_s2_cap_hits = 0;
+int g_s2_eod_hits = 0;
+#endif
+
+/* s2[i], or -1 once the stream can produce no more.
+ *
+ * The Rice inverse reads with a strictly non-decreasing index (j only ever
+ * advances, within a call and across calls), so at most ONE symbol is live at a
+ * time: whatever was decoded last, which the caller may re-read before moving
+ * on. Nothing already consumed is ever looked at again. So no backing array is
+ * needed, and with it goes the `2 * count` storage bound that used to cap the
+ * stream -- the bound that silently truncated dense 192 kHz / 24-bit frames and
+ * fed the Rice inverse zeros, exploding the reconstructed spectrum. */
 static LHDC_HOT LHDC_ALWAYS_INLINE int s2_at(s2_lazy_t *z, int i)
 {
-    while (i >= z->len) {
+    while (i > z->cur_idx) {
         if (z->eos) return -1;
-        if (z->len >= z->cap || z->d->p > z->d->len) { z->eos = 1; return -1; }
-        z->save_idx   = z->len;
+        if (z->d->p > z->d->len || z->produced >= z->hard_cap) {
+#if defined(LHDC_HOST_BUILD)
+            if (z->produced >= z->hard_cap) g_s2_cap_hits++; else g_s2_eod_hits++;
+#endif
+            z->eos = 1;
+            return -1;
+        }
         z->save_p     = z->d->p;
         z->save_range = z->d->range;
-        z->s2[z->len++] = (uint8_t)fac_decode(z->d, z->m);
+        z->cur_val    = fac_decode(z->d, z->m);
+        z->cur_idx++;
+        z->produced++;
     }
-    return z->s2[i];
+    return (i == z->cur_idx) ? z->cur_val : -1;
 }
 
 /* Decoder state (byte position + range) after exactly `used` pass-2 symbols --
  * what the old pass-3 re-decode computed. */
 static void s2_state_after(s2_lazy_t *z, int used, int *p_out, uint32_t *range_out)
 {
-    if (used < z->len) {
-        /* Only case: one lookahead symbol was decoded but not consumed. */
+    if (used == z->produced - 1) {
+        /* One lookahead symbol was decoded but not consumed: the state to report
+         * is the one captured just before it. */
         *p_out = z->save_p; *range_out = z->save_range;
-        (void)z->save_idx;   /* == used by construction */
-    } else {
+    } else if (used >= z->produced) {
         /* The Rice inverse walked past what the stream produced (end of input).
-         * The old code re-decoded `used` symbols regardless, so match it. */
-        for (int i = z->len; i < used; i++) (void)fac_decode(z->d, z->m);
+         * The pre-lazy code re-decoded `used` symbols regardless, so match it. */
+        for (int i = z->produced; i < used; i++) (void)fac_decode(z->d, z->m);
+        *p_out = z->d->p; *range_out = z->d->range;
+    } else {
+        /* Cannot happen with a non-decreasing reader, but stay defined. */
         *p_out = z->d->p; *range_out = z->d->range;
     }
 }
@@ -405,7 +431,6 @@ lhdc_dec_ret_t lhdc_entropy_decode_spectrum_ex2(int32_t *quant_spectrum,
      */
     uint8_t *facbuf = scratch_fac;
     uint8_t *s1 = scratch_s1;
-    uint8_t *s2 = scratch_s2;
 #if defined(LHDC_HOST_BUILD)
     { extern volatile int g_lhdc_trace; if (g_lhdc_trace > 0) { g_fdc = 0; g_block++; } }
 #endif
@@ -427,18 +452,24 @@ lhdc_dec_ret_t lhdc_entropy_decode_spectrum_ex2(int32_t *quant_spectrum,
     for (int i = 0; i < count; i++) s1[i] = (uint8_t)fac_decode(&d, pm1);
 
     fac_model_init(pm2, FAC_FQ2, ma_win2 > 0 ? ma_win2 : 256);
-    int s2cap = scratch_s2_cap;
-    /* The Rice inverse never needs > ~2 pass-2 symbols per coeff; 2*count is a safe
-     * ceiling (verified: capping here vs decoding to end-of-input does not change
-     * the decoded result on the full stress corpus). The symbols are now decoded
-     * ON DEMAND under this same bound instead of being pre-decoded in full: the
-     * Rice inverse consumes only a fraction of them, so the eager fill was the
-     * decoder's single largest block of wasted work. */
-    int lazy_cap = (count * 2 < s2cap) ? count * 2 : s2cap;
+    /* Pass-2 symbols are pulled on demand and only one is ever live, so the only
+     * real bound is the encoded byte stream running out. `hard_cap` exists purely
+     * so a corrupt frame cannot spin: the adaptive model can, in principle, code
+     * a symbol in far less than a bit, so "bytes remaining" alone does not bound
+     * the symbol count. 16 per coefficient is an order of magnitude above the
+     * worst case observed across every rate/depth/bitrate.
+     *
+     * The previous bound was 2 per coefficient AND it truncated the stream
+     * silently -- dense 192 kHz / 24-bit frames at 900k-1000k need more than
+     * that, so the Rice inverse read zeros and the frame's spectrum exploded
+     * (peaks ~26x the clip limit -> concealment -> audible statics). scratch_s2
+     * is no longer used for storage and is kept only for API compatibility. */
+    (void)scratch_s2; (void)scratch_s2_cap;
     s2_lazy_t z;
-    z.d = &d; z.m = pm2; z.s2 = s2;
-    z.len = 0; z.cap = lazy_cap; z.eos = 0;
-    z.save_idx = 0; z.save_p = d.p; z.save_range = d.range;
+    z.d = &d; z.m = pm2;
+    z.cur_idx = -1; z.cur_val = 0; z.produced = 0; z.eos = 0;
+    z.hard_cap = count * 16;
+    z.save_p = d.p; z.save_range = d.range;
 
 #if defined(LHDC_HOST_BUILD)
     { extern volatile int g_lhdc_trace;
