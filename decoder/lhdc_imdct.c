@@ -139,13 +139,12 @@ static void lhdc_imdct_ref(const float *in, float *out, int mdct_size)
  * lhdc_imdct_free_480() when the decoder reconfigures to a non-480 rate (e.g.
  * 96k) or LHDC is torn down (so they cost 0 while LDAC/SBC is playing).
  * malloc'd internal heap is DRAM, satisfying the no-flash requirement.
- * Layout (floats): w1_r/i 64 each, w2_r/i 225 each, tw_r/i 120 each, rot_r/i
- * 120 each = 1058 floats. */
-#define S480_NFLOATS (2*IMDCT_N1*IMDCT_N1 + 2*IMDCT_N2*IMDCT_N2 \
-                      + 2*IMDCT_N2*IMDCT_N1 + 2*IMDCT_P)
+ * Layout (floats): tw_r/i 120 each, rot_r/i 120 each = 480 floats.
+ * No w1 (8x8) or w2 (15x15) DFT matrices: stage 1 is a radix-2 8-point FFT with
+ * compile-time twiddles and stage 2 is the shared radix-3/5 dft15, so both
+ * matrices (578 floats = 2.3 KB of byte-addressable DRAM) are dead -> dropped. */
+#define S480_NFLOATS (2*IMDCT_N2*IMDCT_N1 + 2*IMDCT_P)
 static float *s480_mem = NULL;
-static float *s_w1_r, *s_w1_i;   /* radix-8 DFT  */
-static float *s_w2_r, *s_w2_i;   /* radix-15 DFT */
 static float *s_tw_r, *s_tw_i;   /* four-step twiddle */
 static float *s_rot_r, *s_rot_i; /* pre/post rotation */
 static int   s_fast_built = 0;
@@ -167,27 +166,11 @@ static void lhdc_imdct_build_fast_tables(void)
     }
     {
         float *p = s480_mem;
-        s_w1_r = p; p += IMDCT_N1*IMDCT_N1;
-        s_w1_i = p; p += IMDCT_N1*IMDCT_N1;
-        s_w2_r = p; p += IMDCT_N2*IMDCT_N2;
-        s_w2_i = p; p += IMDCT_N2*IMDCT_N2;
         s_tw_r = p; p += IMDCT_N2*IMDCT_N1;
         s_tw_i = p; p += IMDCT_N2*IMDCT_N1;
         s_rot_r = p; p += IMDCT_P;
         s_rot_i = p; p += IMDCT_P;
     }
-    for (int k = 0; k < IMDCT_N1; k++)
-        for (int n = 0; n < IMDCT_N1; n++) {
-            float a = -2.0f * M_PIF / IMDCT_N1 * (float)k * (float)n;
-            s_w1_r[k * IMDCT_N1 + n] = cosf(a);
-            s_w1_i[k * IMDCT_N1 + n] = sinf(a);
-        }
-    for (int k = 0; k < IMDCT_N2; k++)
-        for (int n = 0; n < IMDCT_N2; n++) {
-            float a = -2.0f * M_PIF / IMDCT_N2 * (float)k * (float)n;
-            s_w2_r[k * IMDCT_N2 + n] = cosf(a);
-            s_w2_i[k * IMDCT_N2 + n] = sinf(a);
-        }
     for (int n2 = 0; n2 < IMDCT_N2; n2++)
         for (int k1 = 0; k1 < IMDCT_N1; k1++) {
             float a = -2.0f * M_PIF / IMDCT_P * (float)n2 * (float)k1;
@@ -212,20 +195,8 @@ static void lhdc_imdct_build_fast_tables(void)
  * 7e-16); the on-device IMDCT self-test (fast vs reference cos formula) is the
  * final guard. Constants below are exact (cos/sin of 2pi/3, 2pi/5, 2pi/15),
  * const -> flash (tiny). Index map: n = 5*n1+n2 (n1<3,n2<5); k = 3*k2+k1. */
-static const float DFT3_r[9] = {1.0f,1.0f,1.0f, 1.0f,-0.5f,-0.5f, 1.0f,-0.5f,-0.5f};
-static const float DFT3_i[9] = {0.0f,0.0f,0.0f, 0.0f,-0.866025404f,0.866025404f, 0.0f,0.866025404f,-0.866025404f};
-static const float DFT5_r[25] = {
-    1.0f,1.0f,1.0f,1.0f,1.0f,
-    1.0f,0.309016994f,-0.809016994f,-0.809016994f,0.309016994f,
-    1.0f,-0.809016994f,0.309016994f,0.309016994f,-0.809016994f,
-    1.0f,-0.809016994f,0.309016994f,0.309016994f,-0.809016994f,
-    1.0f,0.309016994f,-0.809016994f,-0.809016994f,0.309016994f};
-static const float DFT5_i[25] = {
-    0.0f,0.0f,0.0f,0.0f,0.0f,
-    0.0f,-0.951056516f,-0.587785252f,0.587785252f,0.951056516f,
-    0.0f,-0.587785252f,0.951056516f,-0.951056516f,0.587785252f,
-    0.0f,0.587785252f,-0.951056516f,0.951056516f,-0.587785252f,
-    0.0f,0.951056516f,0.587785252f,-0.587785252f,-0.951056516f};
+/* Post-twiddle for the 3x5 Cooley-Tukey split: TW35[k1*5+n2] = exp(-2*pi*i*k1*n2/15).
+ * Row k1=0 is identically 1, so it is skipped at the call site. */
 static const float TW35_r[15] = {
     1.0f,1.0f,1.0f,1.0f,1.0f,
     1.0f,0.913545458f,0.669130606f,0.309016994f,-0.104528463f,
@@ -235,66 +206,159 @@ static const float TW35_i[15] = {
     0.0f,-0.406736643f,-0.743144825f,-0.951056516f,-0.994521895f,
     0.0f,-0.743144825f,-0.994521895f,-0.587785252f,0.207911691f};
 
-/* 15-point DFT of g[0..14] (g[k1*... no: g indexed 0..14, n=5*n1+n2) ->
- * X[base + stride*(3*k2+k1)] for the 15 outputs. */
+/* Butterfly constants (compile-time literals, so they live in registers instead
+ * of being re-loaded from a matrix every iteration). */
+#define D3_S   0.866025404f      /* sin(2*pi/3)  */
+#define D5_C1  0.309016994f      /* cos(2*pi/5)  */
+#define D5_S1  0.951056516f      /* sin(2*pi/5)  */
+#define D5_C2 -0.809016994f      /* cos(4*pi/5)  */
+#define D5_S2  0.587785252f      /* sin(4*pi/5)  */
+
+/*
+ * 15-point DFT of g[n], n = 5*n1 + n2 -> X[base + stride*(3*k2 + k1)].
+ *
+ * 3x5 Cooley-Tukey, but both sub-DFTs are proper butterflies rather than the
+ * dense matrix-vector products this used to do. The matrix form cost ~1020
+ * real flops plus ~240 table loads per call; the butterflies cost ~290 flops
+ * and load nothing but the 10 post-twiddles. dft15 is called 32x per 192k
+ * IMDCT (16x at 96k) and was ~60% of the whole transform, so this is the
+ * single biggest compute win in the decoder on a chip without ARM's headroom.
+ * Arithmetic is reordered, so results differ from the matrix form in the last
+ * ~1 ulp; the per-rate IMDCT self-test bounds the end-to-end error.
+ */
 static LHDC_HOT void lhdc_dft15(const float *gr, const float *gi,
                                 float *Xr, float *Xi, int base, int stride)
 {
     float Br[15], Bi[15];   /* B[k1*5 + n2] (post-twiddle) */
-    /* Stage 1: a DFT-3 over n1 for each n2, then the 3x5 twiddle. */
+
+    /* Stage 1: radix-3 butterfly over n1 for each n2, then the 3x5 twiddle. */
     for (int n2 = 0; n2 < 5; n2++) {
-        float g0r = gr[n2],      g0i = gi[n2];
-        float g1r = gr[5 + n2],  g1i = gi[5 + n2];
-        float g2r = gr[10 + n2], g2i = gi[10 + n2];
-        for (int k1 = 0; k1 < 3; k1++) {
-            float a0r = DFT3_r[k1*3+0], a0i = DFT3_i[k1*3+0];
-            float a1r = DFT3_r[k1*3+1], a1i = DFT3_i[k1*3+1];
-            float a2r = DFT3_r[k1*3+2], a2i = DFT3_i[k1*3+2];
-            float ar = a0r*g0r - a0i*g0i + a1r*g1r - a1i*g1i + a2r*g2r - a2i*g2i;
-            float ai = a0r*g0i + a0i*g0r + a1r*g1i + a1i*g1r + a2r*g2i + a2i*g2r;
-            float tr = TW35_r[k1*5+n2], ti = TW35_i[k1*5+n2];
-            Br[k1*5+n2] = ar*tr - ai*ti;
-            Bi[k1*5+n2] = ar*ti + ai*tr;
+        const float g0r = gr[n2],      g0i = gi[n2];
+        const float g1r = gr[5 + n2],  g1i = gi[5 + n2];
+        const float g2r = gr[10 + n2], g2i = gi[10 + n2];
+
+        const float sr = g1r + g2r, si = g1i + g2i;   /* g1 + g2 */
+        const float dr = g1r - g2r, di = g1i - g2i;   /* g1 - g2 */
+        const float ur = g0r - 0.5f * sr, ui = g0i - 0.5f * si;
+        const float vr = D3_S * dr,       vi = D3_S * di;
+
+        /* k1 = 0: A0 = g0 + (g1+g2); twiddle is 1 -> store straight through. */
+        Br[n2] = g0r + sr;  Bi[n2] = g0i + si;
+
+        /* k1 = 1: A1 = u - i*v ; k1 = 2: A2 = u + i*v */
+        {
+            const float a1r = ur + vi, a1i = ui - vr;
+            const float t1r = TW35_r[5 + n2], t1i = TW35_i[5 + n2];
+            Br[5 + n2] = a1r * t1r - a1i * t1i;
+            Bi[5 + n2] = a1r * t1i + a1i * t1r;
+        }
+        {
+            const float a2r = ur - vi, a2i = ui + vr;
+            const float t2r = TW35_r[10 + n2], t2i = TW35_i[10 + n2];
+            Br[10 + n2] = a2r * t2r - a2i * t2i;
+            Bi[10 + n2] = a2r * t2i + a2i * t2r;
         }
     }
-    /* Stage 2: a DFT-5 over n2 for each k1 -> X[base + stride*(3*k2+k1)]. */
+
+    /* Stage 2: radix-5 butterfly over n2 for each k1 -> X[base + stride*(3*k2+k1)]. */
     for (int k1 = 0; k1 < 3; k1++) {
-        const float *br = &Br[k1*5];
-        const float *bi = &Bi[k1*5];
-        for (int k2 = 0; k2 < 5; k2++) {
-            float ar = 0.0f, ai = 0.0f;
-            const float *wr = &DFT5_r[k2*5];
-            const float *wi = &DFT5_i[k2*5];
-            for (int n2 = 0; n2 < 5; n2++) {
-                ar += wr[n2]*br[n2] - wi[n2]*bi[n2];
-                ai += wr[n2]*bi[n2] + wi[n2]*br[n2];
-            }
-            int k = 3*k2 + k1;
-            Xr[base + stride*k] = ar;
-            Xi[base + stride*k] = ai;
-        }
+        const float *br = &Br[k1 * 5];
+        const float *bi = &Bi[k1 * 5];
+        const float b0r = br[0], b0i = bi[0];
+
+        const float t1r = br[1] + br[4], t1i = bi[1] + bi[4];
+        const float t2r = br[2] + br[3], t2i = bi[2] + bi[3];
+        const float t3r = br[1] - br[4], t3i = bi[1] - bi[4];
+        const float t4r = br[2] - br[3], t4i = bi[2] - bi[3];
+
+        const float m1r = b0r + D5_C1 * t1r + D5_C2 * t2r;
+        const float m1i = b0i + D5_C1 * t1i + D5_C2 * t2i;
+        const float m2r = b0r + D5_C2 * t1r + D5_C1 * t2r;
+        const float m2i = b0i + D5_C2 * t1i + D5_C1 * t2i;
+        const float p1r = D5_S1 * t3r + D5_S2 * t4r;
+        const float p1i = D5_S1 * t3i + D5_S2 * t4i;
+        const float p2r = D5_S2 * t3r - D5_S1 * t4r;
+        const float p2i = D5_S2 * t3i - D5_S1 * t4i;
+
+        float *const xr = Xr + base + stride * k1;   /* k = 3*k2 + k1 */
+        float *const xi = Xi + base + stride * k1;
+        const int st3 = stride * 3;
+
+        xr[0]       = b0r + t1r + t2r;  xi[0]       = b0i + t1i + t2i;  /* k2 = 0 */
+        xr[st3]     = m1r + p1i;        xi[st3]     = m1i - p1r;        /* k2 = 1 */
+        xr[st3 * 2] = m2r + p2i;        xi[st3 * 2] = m2i - p2r;        /* k2 = 2 */
+        xr[st3 * 3] = m2r - p2i;        xi[st3 * 3] = m2i + p2r;        /* k2 = 3 */
+        xr[st3 * 4] = m1r - p1i;        xi[st3 * 4] = m1i + p1r;        /* k2 = 4 */
     }
 }
+
+/* W8^1 = (sqrt(2)/2)(1 - i), W8^3 = -(sqrt(2)/2)(1 + i): one shared magnitude. */
+#define W8_C 0.70710678118654752f
+/* bit-reversal permutation for the 8-point DIT FFT. */
+static const uint8_t S480_BR8[8] = { 0, 4, 2, 6, 1, 5, 3, 7 };
 
 static LHDC_HOT void lhdc_fft120(const float *zr, const float *zi, float *Xr, float *Xi)
 {
     float Gr[IMDCT_P], Gi[IMDCT_P];   /* G[k1*15 + n2] */
     /* Stage 1: radix-8 DFT over n1 for each n2, then four-step twiddle. */
     for (int n2 = 0; n2 < IMDCT_N2; n2++) {
-        for (int k1 = 0; k1 < IMDCT_N1; k1++) {
-            float ar = 0.0f, ai = 0.0f;
-            const float *w1r = &s_w1_r[k1 * IMDCT_N1];
-            const float *w1i = &s_w1_i[k1 * IMDCT_N1];
-            for (int n1 = 0; n1 < IMDCT_N1; n1++) {
-                int idx = n2 + IMDCT_N2 * n1;
-                float xr = zr[idx], xi = zi[idx];
-                ar += w1r[n1] * xr - w1i[n1] * xi;
-                ai += w1r[n1] * xi + w1i[n1] * xr;
+        float ar[8], ai[8];
+        for (int i = 0; i < 8; i++) {            /* gather, bit-reversal folded in */
+            int idx = n2 + IMDCT_N2 * (int)S480_BR8[i];
+            ar[i] = zr[idx]; ai[i] = zi[idx];
+        }
+        /* Radix-2 DIT, all three stages written out. W8^0 = 1 and W8^2 = -i need
+         * no multiply; only W8^1 and W8^3 do, and both are +-(sqrt(2)/2)(1 -+ i)
+         * compile-time constants. This replaces a dense 8x8 matrix-vector product
+         * (512 real flops per 8-point DFT, plus 128 table loads) with ~52 flops. */
+        for (int k = 0; k < 8; k += 2) {                    /* stage 1: W = 1 */
+            float ur = ar[k], ui = ai[k], br = ar[k + 1], bi = ai[k + 1];
+            ar[k]     = ur + br; ai[k]     = ui + bi;
+            ar[k + 1] = ur - br; ai[k + 1] = ui - bi;
+        }
+        for (int k = 0; k < 8; k += 4) {                    /* stage 2 */
+            {                                               /*  j=0 -> W=1 */
+                float ur = ar[k], ui = ai[k], br = ar[k + 2], bi = ai[k + 2];
+                ar[k]     = ur + br; ai[k]     = ui + bi;
+                ar[k + 2] = ur - br; ai[k + 2] = ui - bi;
             }
+            {                                               /*  j=1 -> W8^2 = -i */
+                float ur = ar[k + 1], ui = ai[k + 1];
+                float tr = ai[k + 3], ti = -ar[k + 3];
+                ar[k + 1] = ur + tr; ai[k + 1] = ui + ti;
+                ar[k + 3] = ur - tr; ai[k + 3] = ui - ti;
+            }
+        }
+        {                                                   /* stage 3: h = 4 */
+            {                                               /*  j=0 -> W=1 */
+                float ur = ar[0], ui = ai[0], br = ar[4], bi = ai[4];
+                ar[0] = ur + br; ai[0] = ui + bi;
+                ar[4] = ur - br; ai[4] = ui - bi;
+            }
+            {                                               /*  j=1 -> W8^1 */
+                float ur = ar[1], ui = ai[1], br = ar[5], bi = ai[5];
+                float tr = W8_C * (br + bi), ti = W8_C * (bi - br);
+                ar[1] = ur + tr; ai[1] = ui + ti;
+                ar[5] = ur - tr; ai[5] = ui - ti;
+            }
+            {                                               /*  j=2 -> W8^2 = -i */
+                float ur = ar[2], ui = ai[2];
+                float tr = ai[6], ti = -ar[6];
+                ar[2] = ur + tr; ai[2] = ui + ti;
+                ar[6] = ur - tr; ai[6] = ui - ti;
+            }
+            {                                               /*  j=3 -> W8^3 */
+                float ur = ar[3], ui = ai[3], br = ar[7], bi = ai[7];
+                float tr = W8_C * (bi - br), ti = -W8_C * (br + bi);
+                ar[3] = ur + tr; ai[3] = ui + ti;
+                ar[7] = ur - tr; ai[7] = ui - ti;
+            }
+        }
+        for (int k1 = 0; k1 < IMDCT_N1; k1++) {             /* four-step twiddle */
             float tr = s_tw_r[n2 * IMDCT_N1 + k1];
             float ti = s_tw_i[n2 * IMDCT_N1 + k1];
-            Gr[k1 * IMDCT_N2 + n2] = ar * tr - ai * ti;
-            Gi[k1 * IMDCT_N2 + n2] = ar * ti + ai * tr;
+            Gr[k1 * IMDCT_N2 + n2] = ar[k1] * tr - ai[k1] * ti;
+            Gi[k1 * IMDCT_N2 + n2] = ar[k1] * ti + ai[k1] * tr;
         }
     }
     /* Stage 2: 15-point DFT (3x5 Cooley-Tukey) over n2 for each k1 -> X[k1 + 8*k2]. */
@@ -328,16 +392,20 @@ static LHDC_HOT void lhdc_imdct_fast_480(const float *in, float *out)
         imZ[k] = (Xr[k] * ri + Xi[k] * rr) * invM;
     }
 
-    /* Symmetric unfold into the N time samples (validated convention). */
-    for (int p = 0; p < IMDCT_M; p++) {
-        int ne = 2 * p;
-        if      (p < 60)  out[ne] =  reZ[60 + p];
-        else if (p < 180) out[ne] =  imZ[p - 60];
-        else              out[ne] = -reZ[p - 180];
-        int no = 2 * p + 1;
-        if      (p < 60)  out[no] = -imZ[59 - p];
-        else if (p < 180) out[no] = -reZ[179 - p];
-        else              out[no] =  imZ[299 - p];
+    /* Symmetric unfold, P=120, M=240 (validated convention). Split into three branch-free
+     * segments: the old single loop re-evaluated two 3-way range tests on every
+     * one of the 240 iterations, and the ranges are compile-time constants. */
+    for (int p = 0; p < 60; p++) {
+        out[2 * p]     =  reZ[60 + p];
+        out[2 * p + 1] = -imZ[59 - p];
+    }
+    for (int p = 60; p < 180; p++) {
+        out[2 * p]     =  imZ[p - 60];
+        out[2 * p + 1] = -reZ[179 - p];
+    }
+    for (int p = 180; p < 240; p++) {
+        out[2 * p]     = -reZ[p - 180];
+        out[2 * p + 1] =  imZ[299 - p];
     }
 }
 
@@ -366,8 +434,7 @@ static LHDC_HOT void lhdc_imdct_fast_480(const float *in, float *out)
  * deref in the self-test). Two ~7.7 KB blocks each fit a 13 KB hole. */
 /* No w1 (16x16) table: stage 1 is a radix-2 16-pt FFT using s960_w16r/i (8
  * twiddles), so the old 16x16 DFT matrix (512 floats) is dead -> dropped. */
-#define S960_TBL_FLOATS (2*IMDCT_N2_960*IMDCT_N2_960 \
-                         + 2*IMDCT_N2_960*IMDCT_N1_960 + 2*IMDCT_P_960)   /* twiddle tables */
+#define S960_TBL_FLOATS (2*IMDCT_N2_960*IMDCT_N1_960 + 2*IMDCT_P_960)    /* twiddle tables */
 /* FFT scratch: only 2 P-sized buffers (zr,zi). Everything else aliases:
  *  - Xr,Xi (fft240 output) and reZ,imZ (post-twiddle output) reuse zr,zi: the
  *    pre-twiddle input is fully consumed by fft240 stage 1 before stage 2 writes,
@@ -379,7 +446,6 @@ static LHDC_HOT void lhdc_imdct_fast_480(const float *in, float *out)
 #define S960_SCR_FLOATS (2*IMDCT_P_960)                                    /* FFT scratch (zr,zi) */
 static float *s960_tbl = NULL;   /* persistent twiddle tables */
 static float *s960_scr = NULL;   /* per-transform scratch */
-static float *s960_w2_r, *s960_w2_i;
 static float *s960_tw_r, *s960_tw_i, *s960_rot_r, *s960_rot_i;
 static float *s960_Gr, *s960_Gi, *s960_zr, *s960_zi;
 static float *s960_Xr, *s960_Xi, *s960_reZ, *s960_imZ;
@@ -415,8 +481,6 @@ static void lhdc_imdct_build_fast_tables_960(void)
         if (!s960_scr) { free(s960_tbl); s960_tbl = NULL; return; }
     }
     float *p = s960_tbl;
-    s960_w2_r = p; p += IMDCT_N2_960*IMDCT_N2_960;
-    s960_w2_i = p; p += IMDCT_N2_960*IMDCT_N2_960;
     s960_tw_r = p; p += IMDCT_N2_960*IMDCT_N1_960;
     s960_tw_i = p; p += IMDCT_N2_960*IMDCT_N1_960;
     s960_rot_r = p; p += IMDCT_P_960;
@@ -429,12 +493,6 @@ static void lhdc_imdct_build_fast_tables_960(void)
     s960_reZ = s960_zr; s960_imZ = s960_zi;    /* post-twiddle in place (uses temps) */
     /* s960_Gr/s960_Gi are NOT carved here — they borrow the caller's `out`
      * buffer per-call (set in lhdc_imdct_fast_960). */
-    for (int k = 0; k < IMDCT_N2_960; k++)
-        for (int n = 0; n < IMDCT_N2_960; n++) {
-            float a = -2.0f * M_PIF / IMDCT_N2_960 * (float)k * (float)n;
-            s960_w2_r[k * IMDCT_N2_960 + n] = cosf(a);
-            s960_w2_i[k * IMDCT_N2_960 + n] = sinf(a);
-        }
     for (int n2 = 0; n2 < IMDCT_N2_960; n2++)
         for (int k1 = 0; k1 < IMDCT_N1_960; k1++) {
             float a = -2.0f * M_PIF / IMDCT_P_960 * (float)n2 * (float)k1;
@@ -466,10 +524,36 @@ static LHDC_HOT void lhdc_fft240(const float *zr, const float *zi, float *Xr, fl
             int idx = n2 + IMDCT_N2_960 * (int)S960_BR16[i];
             ar[i] = zr[idx]; ai[i] = zi[idx];
         }
-        for (int s = 1; s <= 4; s++) {
+        /* Same trivial-twiddle specialization as the 32-point stage in fft480:
+         * W16^0 = 1 and W16^4 = -i need no multiply. */
+        for (int k = 0; k < 16; k += 2) {              /* stage 1: m=2, W=1 */
+            float ur = ar[k], ui = ai[k], br = ar[k + 1], bi = ai[k + 1];
+            ar[k]     = ur + br; ai[k]     = ui + bi;
+            ar[k + 1] = ur - br; ai[k + 1] = ui - bi;
+        }
+        for (int k = 0; k < 16; k += 4) {              /* stage 2: m=4 */
+            {                                          /*  j=0 -> W=1 */
+                float ur = ar[k], ui = ai[k], br = ar[k + 2], bi = ai[k + 2];
+                ar[k]     = ur + br; ai[k]     = ui + bi;
+                ar[k + 2] = ur - br; ai[k + 2] = ui - bi;
+            }
+            {                                          /*  j=1 -> W16^4 = -i */
+                float ur = ar[k + 1], ui = ai[k + 1];
+                float br = ar[k + 3], bi = ai[k + 3];
+                float tr = bi, ti = -br;
+                ar[k + 1] = ur + tr; ai[k + 1] = ui + ti;
+                ar[k + 3] = ur - tr; ai[k + 3] = ui - ti;
+            }
+        }
+        for (int s = 3; s <= 4; s++) {
             int m = 1 << s, h = m >> 1, step = 16 / m;
             for (int k = 0; k < 16; k += m) {
-                for (int j = 0; j < h; j++) {
+                {                                      /*  j=0 -> W=1 */
+                    float ur = ar[k], ui = ai[k], br = ar[k + h], bi = ai[k + h];
+                    ar[k]     = ur + br; ai[k]     = ui + bi;
+                    ar[k + h] = ur - br; ai[k + h] = ui - bi;
+                }
+                for (int j = 1; j < h; j++) {
                     int tw = j * step;             /* index into W16[0..7] */
                     float wr = s960_w16r[tw], wi = s960_w16i[tw];
                     float br = ar[k + j + h], bi = ai[k + j + h];
@@ -518,16 +602,20 @@ static LHDC_HOT void lhdc_imdct_fast_960(const float *in, float *out)
         s960_reZ[k] = (xr * rr - xi * ri) * invM;
         s960_imZ[k] = (xr * ri + xi * rr) * invM;
     }
-    /* Symmetric unfold: P=240, M=480 (P/2=120, 3P/2=360, 5P/2-1=599). */
-    for (int p = 0; p < IMDCT_M_960; p++) {
-        int ne = 2 * p;
-        if      (p < 120) out[ne] =  s960_reZ[120 + p];
-        else if (p < 360) out[ne] =  s960_imZ[p - 120];
-        else              out[ne] = -s960_reZ[p - 360];
-        int no = 2 * p + 1;
-        if      (p < 120) out[no] = -s960_imZ[119 - p];
-        else if (p < 360) out[no] = -s960_reZ[359 - p];
-        else              out[no] =  s960_imZ[599 - p];
+    /* Symmetric unfold, P=240, M=480. Split into three branch-free
+     * segments: the old single loop re-evaluated two 3-way range tests on every
+     * one of the 480 iterations, and the ranges are compile-time constants. */
+    for (int p = 0; p < 120; p++) {
+        out[2 * p]     =  s960_reZ[120 + p];
+        out[2 * p + 1] = -s960_imZ[119 - p];
+    }
+    for (int p = 120; p < 360; p++) {
+        out[2 * p]     =  s960_imZ[p - 120];
+        out[2 * p + 1] = -s960_reZ[359 - p];
+    }
+    for (int p = 360; p < 480; p++) {
+        out[2 * p]     = -s960_reZ[p - 360];
+        out[2 * p + 1] =  s960_imZ[599 - p];
     }
 }
 
@@ -573,12 +661,10 @@ static void lhdc_imdct_selftest_960(void)
 #define IMDCT_N1_1920 32
 #define IMDCT_N2_1920 15
 
-#define S1920_TBL_FLOATS (2*IMDCT_N2_1920*IMDCT_N2_1920 \
-                          + 2*IMDCT_N2_1920*IMDCT_N1_1920 + 2*IMDCT_P_1920)
+#define S1920_TBL_FLOATS (2*IMDCT_N2_1920*IMDCT_N1_1920 + 2*IMDCT_P_1920)
 #define S1920_SCR_FLOATS (2*IMDCT_P_1920)
 static float *s1920_tbl = NULL;   /* persistent twiddle tables */
 static float *s1920_scr = NULL;   /* per-transform scratch (zr,zi) */
-static float *s1920_w2_r, *s1920_w2_i;
 static float *s1920_tw_r, *s1920_tw_i, *s1920_rot_r, *s1920_rot_i;
 static float *s1920_Gr, *s1920_Gi, *s1920_zr, *s1920_zi;
 static float *s1920_Xr, *s1920_Xi, *s1920_reZ, *s1920_imZ;
@@ -612,8 +698,6 @@ static void lhdc_imdct_build_fast_tables_1920(void)
         if (!s1920_scr) { free(s1920_tbl); s1920_tbl = NULL; return; }
     }
     float *p = s1920_tbl;
-    s1920_w2_r = p; p += IMDCT_N2_1920*IMDCT_N2_1920;
-    s1920_w2_i = p; p += IMDCT_N2_1920*IMDCT_N2_1920;
     s1920_tw_r = p; p += IMDCT_N2_1920*IMDCT_N1_1920;
     s1920_tw_i = p; p += IMDCT_N2_1920*IMDCT_N1_1920;
     s1920_rot_r = p; p += IMDCT_P_1920;
@@ -624,12 +708,6 @@ static void lhdc_imdct_build_fast_tables_1920(void)
      * post-twiddle rewrites them via temps; Gr,Gi borrow the caller's out. */
     s1920_Xr = s1920_zr;  s1920_Xi = s1920_zi;
     s1920_reZ = s1920_zr; s1920_imZ = s1920_zi;
-    for (int k = 0; k < IMDCT_N2_1920; k++)
-        for (int n = 0; n < IMDCT_N2_1920; n++) {
-            float a = -2.0f * M_PIF / IMDCT_N2_1920 * (float)k * (float)n;
-            s1920_w2_r[k * IMDCT_N2_1920 + n] = cosf(a);
-            s1920_w2_i[k * IMDCT_N2_1920 + n] = sinf(a);
-        }
     for (int n2 = 0; n2 < IMDCT_N2_1920; n2++)
         for (int k1 = 0; k1 < IMDCT_N1_1920; k1++) {
             float a = -2.0f * M_PIF / IMDCT_P_1920 * (float)n2 * (float)k1;
@@ -659,10 +737,39 @@ static LHDC_HOT void lhdc_fft480(const float *zr, const float *zi, float *Xr, fl
             int idx = n2 + IMDCT_N2_1920 * (int)S1920_BR32[i];
             ar[i] = zr[idx]; ai[i] = zi[idx];
         }
-        for (int s = 1; s <= 5; s++) {
+        /* Stages 1-2 have only trivial twiddles (W32^0 = 1, W32^8 = -i), so they
+         * are written out without the complex multiply: 31 of the 80 butterflies
+         * in a 32-point FFT need no multiply at all and 15 more are just a
+         * swap+negate. Stages 3-5 keep the generic butterfly but hoist j = 0
+         * (always W = 1) out of the inner loop. */
+        for (int k = 0; k < 32; k += 2) {              /* stage 1: m=2, W=1 */
+            float ur = ar[k], ui = ai[k], br = ar[k + 1], bi = ai[k + 1];
+            ar[k]     = ur + br; ai[k]     = ui + bi;
+            ar[k + 1] = ur - br; ai[k + 1] = ui - bi;
+        }
+        for (int k = 0; k < 32; k += 4) {              /* stage 2: m=4 */
+            {                                          /*  j=0 -> W=1 */
+                float ur = ar[k], ui = ai[k], br = ar[k + 2], bi = ai[k + 2];
+                ar[k]     = ur + br; ai[k]     = ui + bi;
+                ar[k + 2] = ur - br; ai[k + 2] = ui - bi;
+            }
+            {                                          /*  j=1 -> W32^8 = -i */
+                float ur = ar[k + 1], ui = ai[k + 1];
+                float br = ar[k + 3], bi = ai[k + 3];
+                float tr = bi, ti = -br;               /* (-i) * (br + i*bi) */
+                ar[k + 1] = ur + tr; ai[k + 1] = ui + ti;
+                ar[k + 3] = ur - tr; ai[k + 3] = ui - ti;
+            }
+        }
+        for (int s = 3; s <= 5; s++) {
             int m = 1 << s, h = m >> 1, step = 32 / m;
             for (int k = 0; k < 32; k += m) {
-                for (int j = 0; j < h; j++) {
+                {                                      /*  j=0 -> W=1 */
+                    float ur = ar[k], ui = ai[k], br = ar[k + h], bi = ai[k + h];
+                    ar[k]     = ur + br; ai[k]     = ui + bi;
+                    ar[k + h] = ur - br; ai[k + h] = ui - bi;
+                }
+                for (int j = 1; j < h; j++) {
                     int tw = j * step;             /* index into W32[0..15] */
                     float wr = s1920_w32r[tw], wi = s1920_w32i[tw];
                     float br = ar[k + j + h], bi = ai[k + j + h];
@@ -707,16 +814,20 @@ static LHDC_HOT void lhdc_imdct_fast_1920(const float *in, float *out)
         s1920_reZ[k] = (xr * rr - xi * ri) * invM;
         s1920_imZ[k] = (xr * ri + xi * rr) * invM;
     }
-    /* Symmetric unfold: P=480, M=960 (P/2=240, 3P/2=720, 5P/2-1=1199). */
-    for (int p = 0; p < IMDCT_M_1920; p++) {
-        int ne = 2 * p;
-        if      (p < 240) out[ne] =  s1920_reZ[240 + p];
-        else if (p < 720) out[ne] =  s1920_imZ[p - 240];
-        else              out[ne] = -s1920_reZ[p - 720];
-        int no = 2 * p + 1;
-        if      (p < 240) out[no] = -s1920_imZ[239 - p];
-        else if (p < 720) out[no] = -s1920_reZ[719 - p];
-        else              out[no] =  s1920_imZ[1199 - p];
+    /* Symmetric unfold, P=480, M=960. Split into three branch-free
+     * segments: the old single loop re-evaluated two 3-way range tests on every
+     * one of the 960 iterations, and the ranges are compile-time constants. */
+    for (int p = 0; p < 240; p++) {
+        out[2 * p]     =  s1920_reZ[240 + p];
+        out[2 * p + 1] = -s1920_imZ[239 - p];
+    }
+    for (int p = 240; p < 720; p++) {
+        out[2 * p]     =  s1920_imZ[p - 240];
+        out[2 * p + 1] = -s1920_reZ[719 - p];
+    }
+    for (int p = 720; p < 960; p++) {
+        out[2 * p]     = -s1920_reZ[p - 720];
+        out[2 * p + 1] =  s1920_imZ[1199 - p];
     }
 }
 

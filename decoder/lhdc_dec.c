@@ -32,10 +32,21 @@
 /* Stage profiler: cheap on-device timing of the per-channel decode stages so we
  * can see where the real-time budget goes (IMDCT vs entropy vs the rest).
  * The periodic PROF ESP_LOGI stalls the decode task ~9 ms on the UART and
- * stutters audio, so it is OFF by default; set to 1 for bring-up only. */
+ * stutters audio, so it is OFF by default; set to 1 for bring-up only
+ * (overridable from the build: -DLHDCV5_DEC_PROFILE=1). */
+#ifndef LHDCV5_DEC_PROFILE
 #define LHDCV5_DEC_PROFILE 0
+#endif
 #if defined(LHDC_HOST_BUILD)
-  #define LHDC_NOW_US() 0LL
+  /* Real microsecond clock on host so the PROF path works there too. */
+  #include <time.h>
+  static int64_t lhdc_host_now_us(void)
+  {
+      struct timespec ts;
+      timespec_get(&ts, TIME_UTC);
+      return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+  }
+  #define LHDC_NOW_US() lhdc_host_now_us()
 #else
   #define LHDC_NOW_US() esp_timer_get_time()
 #endif
@@ -385,25 +396,30 @@ static LHDC_HOT void lhdc_dec_overlap_add(lhdc_decoder_t *dec, float *pcm_out,
     float *overlap_buf = dec->overlap_buf[channel];
     float *mdct_out = dec->mdct_out;
 
-    /* Window the current IMDCT output */
-    for (int n = 0; n < mdct_size; n++) {
-        mdct_out[n] *= window[n];
+    /* Windowing is fused into the two halves instead of being a separate pass
+     * over all `mdct_size` samples. The old shape read+scaled+stored the whole
+     * IMDCT output (1920 loads + 1920 stores at 192k) and then read it back
+     * again; folding window[] into each consumer removes that entire round trip
+     * and lets the first half become a single fused multiply-add. Identical
+     * arithmetic: each output is still mdct_out[n]*window[n] (+ overlap_buf[n]).
+     *
+     * Note mdct_out[] is no longer left windowed in place -- nothing downstream
+     * reads it (the caller consumes pcm_out, and the next frame overwrites
+     * mdct_out from the IMDCT). */
+
+    /* First half: window + overlap-add with the previous frame's tail. Only
+     * `overlap` (= mdct_size/2 = samples_per_channel) samples are emitted, so
+     * pcm_out is exactly that long (= ch_pcm = w_buf, half-size). */
+    for (int n = 0; n < overlap; n++) {
+        pcm_out[n] = mdct_out[n] * window[n] + overlap_buf[n];
     }
 
-    /* Overlap-add: first half with previous frame overlap. Only `overlap`
-     * (= mdct_size/2 = samples_per_channel) samples are emitted, so pcm_out is
-     * exactly that long (= ch_pcm = w_buf, now half-size). */
+    /* Second half: window and save as next frame's overlap. (The old code also
+     * wrote it to pcm_out[overlap..mdct_size-1], but that range is never emitted
+     * -- the caller reads only pcm_out[0..overlap-1] -- so those were dead
+     * writes that forced w_buf to be full mdct_size. Dropped -> w_buf halves.) */
     for (int n = 0; n < overlap; n++) {
-        pcm_out[n] = mdct_out[n] + overlap_buf[n];
-    }
-
-    /* Save second half for next frame overlap. (The old code also wrote the
-     * second half to pcm_out[overlap..mdct_size-1], but that range is never
-     * emitted -- the caller reads only pcm_out[0..overlap-1] -- and is identical
-     * to what we store in overlap_buf here, so it was dead writes that forced
-     * w_buf to be full mdct_size. Dropped -> w_buf halves.) */
-    for (int n = 0; n < overlap; n++) {
-        overlap_buf[n] = mdct_out[overlap + n];
+        overlap_buf[n] = mdct_out[overlap + n] * window[overlap + n];
     }
 }
 
