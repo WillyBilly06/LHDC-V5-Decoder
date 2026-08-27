@@ -1,0 +1,15 @@
+# Documentation: .gitlab/ci/README.md#manifest-file-to-control-the-buildtest-apps
+
+components/esp_eth/test_apps:
+  enable:
+    - if: IDF_TARGET in ["esp32", "esp32p4"]
+      reason: ESP32 and ESP32P4 have internal EMAC. SPI Ethernet runners are based on ESP32.
+  depends_components:
+    - esp_eth
+    - esp_http_client
+    - esp_hw_support
+    - esp_netif
+    - esp_timer
+    - hal
+    - lwip
+    - soc

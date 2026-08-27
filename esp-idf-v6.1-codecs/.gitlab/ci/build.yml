@@ -1,0 +1,144 @@
+.build_template:
+  stage: build
+  extends:
+    - .after_script:build
+  image: $ESP_ENV_IMAGE
+  tags: [build, shiny]
+  variables:
+    # Enable ccache for all build jobs. See configure_ci_environment.sh for more ccache related settings.
+    IDF_CCACHE_ENABLE: "1"
+  dependencies: # set dependencies to null to avoid missing artifacts issue
+
+
+########################################
+# Clang Build Apps Without Tests Cases #
+########################################
+.build_cmake_clang_template:
+  extends:
+    - .build_template
+    - .rules:build
+  needs:
+    - job: fast_build_check
+      artifacts: false
+    - pipeline_variables
+  artifacts:
+    paths:
+      # The other artifacts patterns are defined under .idf_ci.toml
+      # Now we're uploading/downloading the binary files from our internal storage server
+      #
+      # keep the log file to help debug
+      - "**/build*/build_log.txt"
+      - "**/build*/size*.json"
+    expire_in: 1 week
+    when: always
+  variables:
+    IDF_TOOLCHAIN: clang
+    TEST_BUILD_OPTS_EXTRA: ""
+  script:
+    # CI specific options start from "--parallel-count xxx". could ignore when running locally
+    - run_cmd idf-build-apps build
+      -p tools/test_apps/system/clang_build_test
+      components/esp_security/test_apps/fault_assert_opt_check
+      -t $IDF_TARGET
+      --parallel-count ${CI_NODE_TOTAL:-1}
+      --parallel-index ${CI_NODE_INDEX:-1}
+      --modified-components ${MR_MODIFIED_COMPONENTS}
+      --modified-files ${MR_MODIFIED_FILES}
+      $TEST_BUILD_OPTS_EXTRA
+
+build_clang_test_apps_xtensa:
+  extends: .build_cmake_clang_template
+  parallel:
+    matrix:
+      - IDF_TARGET: [esp32, esp32s2, esp32s3]
+
+build_clang_test_apps_riscv:
+  extends: .build_cmake_clang_template
+  variables:
+    # https://reviews.llvm.org/D90108.
+    # GNU 'as' lets .weak override .globl since binutils-gdb
+    # https://github.com/bminor/binutils-gdb/commit/5ca547dc2399a0a5d9f20626d4bf5547c3ccfddd (1996)
+    # while MC lets the last directive win (PR38921).
+    # For RISCV chips we use integrated assembler by default, so suppress this warning to pass CI pipeline.
+    TEST_BUILD_OPTS_EXTRA: "--ignore-warning-str 'changed binding to STB_WEAK'"
+  parallel:
+    matrix:
+      - IDF_TARGET: [esp32c3, esp32c2, esp32c6, esp32c5, esp32h2, esp32p4]
+
+####################
+# Dynamic Pipeline #
+####################
+pre_check_complete:
+  stage: build
+  image: $ESP_ENV_IMAGE
+  tags: [fast_run, shiny]
+  variables:
+    GIT_STRATEGY: none
+  cache: []
+  before_script: []
+  dependencies: []
+  script:
+    - echo "pre_check stage completed"
+
+generate_build_child_pipeline:
+  extends:
+    - .build_template
+  tags: [fast_run, shiny]
+  dependencies: # set dependencies to null to avoid missing artifacts issue
+  needs:
+    - pipeline_variables
+    - job: pre_check_complete
+      artifacts: false
+    - job: baseline_manifest_sha
+      optional: true
+  artifacts:
+    paths:
+      - build_child_pipeline.yml
+      - test_related_apps.txt
+      - non_test_related_apps.txt
+    expire_in: 1 week
+    when: always
+  script:
+    - run_cmd idf-ci --debug gitlab build-child-pipeline
+      -p components
+      -p examples
+      -p tools/test_apps
+      --modified-files $MR_MODIFIED_FILES
+    - shuf test_related_apps.txt -o test_related_apps.txt
+    - shuf non_test_related_apps.txt -o non_test_related_apps.txt
+
+build_child_pipeline:
+  stage: build
+  needs:
+    - job: fast_build_check
+      optional: true
+      artifacts: false
+    - pipeline_variables
+    - generate_build_child_pipeline
+  variables:
+    MR_MODIFIED_COMPONENTS: $MR_MODIFIED_COMPONENTS
+    MR_MODIFIED_FILES: $MR_MODIFIED_FILES
+    PARENT_PIPELINE_ID: $CI_PIPELINE_ID
+  # https://gitlab.com/gitlab-org/gitlab/-/issues/214340
+  inherit:
+    variables: false
+  trigger:
+    include:
+      - artifact: build_child_pipeline.yml
+        job: generate_build_child_pipeline
+    strategy: depend
+
+generate_prebuild_report:
+  extends:
+    - .build_template
+  tags: [fast_run, shiny]
+  needs:
+    - pipeline_variables
+  artifacts:
+    paths:
+      - prebuild_report.html
+    expire_in: 1 week
+    when: always
+  script:
+    - run_cmd idf-ci build collect --format html -o prebuild_report.html
+    - echo "Report generated at https://${CI_PAGES_HOSTNAME}:${CI_SERVER_PORT}/-/esp-idf/-/jobs/${CI_JOB_ID}/artifacts/prebuild_report.html"

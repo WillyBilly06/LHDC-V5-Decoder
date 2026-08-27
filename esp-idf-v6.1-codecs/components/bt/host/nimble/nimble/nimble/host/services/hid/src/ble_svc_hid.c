@@ -1,0 +1,901 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+#include <assert.h>
+#include <string.h>
+
+#include "sysinit/sysinit.h"
+#include "syscfg/syscfg.h"
+#include "host/ble_hs_log.h"
+
+
+#if MYNEWT_VAL(BLE_SVC_HID_SERVICE)
+#if MYNEWT_VAL(BLE_GATTS)
+#include "host/ble_hs.h"
+#include "host/ble_gap.h"
+#include "services/hid/ble_svc_hid.h"
+#if MYNEWT_VAL(BLE_STATIC_TO_DYNAMIC)
+#include "esp_nimble_mem.h"
+#endif
+
+/* 1 more instance for empty service */
+#define HID_MAX_SVC_INSTANCES (MYNEWT_VAL(BLE_SVC_HID_MAX_SVC_INSTANCES) + 1)
+
+/* maximum 7 characteristics except report characteristic */
+#define HID_MAX_CHRS (HID_MAX_SVC_INSTANCES * \
+                    ((MYNEWT_VAL(BLE_SVC_HID_MAX_RPTS) + 8)))
+#define HID_MAX_DSCS (HID_MAX_SVC_INSTANCES * \
+		    ((2 * MYNEWT_VAL(BLE_SVC_HID_MAX_RPTS) + 2)))
+/* 16 bit UUIDs */
+static const ble_uuid16_t uuid_ext_rpt_ref = BLE_UUID16_INIT(BLE_SVC_HID_DSC_UUID16_EXT_RPT_REF);
+static const ble_uuid16_t uuid_report_map = BLE_UUID16_INIT(BLE_SVC_HID_CHR_UUID16_REPORT_MAP);
+static const ble_uuid16_t uuid_rpt_ref = BLE_UUID16_INIT(BLE_SVC_HID_DSC_UUID16_RPT_REF);
+static const ble_uuid16_t uuid_report = BLE_UUID16_INIT(BLE_SVC_HID_CHR_UUID16_RPT);
+static const ble_uuid16_t uuid_hid_info = BLE_UUID16_INIT(BLE_SVC_HID_CHR_UUID16_HID_INFO);
+static const ble_uuid16_t uuid_hid_ctrl_pt = BLE_UUID16_INIT(BLE_SVC_HID_CHR_UUID16_HID_CTRL_PT);
+static const ble_uuid16_t uuid_proto_mode = BLE_UUID16_INIT(BLE_SVC_HID_CHR_UUID16_PROTOCOL_MODE);
+static const ble_uuid16_t uuid_boot_kbd_inp = BLE_UUID16_INIT(BLE_SVC_HID_CHR_UUID16_BOOT_KBD_INP);
+static const ble_uuid16_t uuid_boot_kbd_out = BLE_UUID16_INIT(BLE_SVC_HID_CHR_UUID16_BOOT_KBD_OUT);
+static const ble_uuid16_t uuid_boot_mouse_inp = BLE_UUID16_INIT(BLE_SVC_HID_CHR_UUID16_BOOT_MOUSE_INP);
+static const ble_uuid16_t uuid_hid_svc = BLE_UUID16_INIT(BLE_SVC_HID_UUID16);
+static ble_svc_hid_report_write_cb_t s_report_write_cb;
+static ble_svc_hid_char_write_cb_t s_char_write_cb;
+
+#if !MYNEWT_VAL(BLE_STATIC_TO_DYNAMIC)
+static struct ble_svc_hid_params hid_instances[HID_MAX_SVC_INSTANCES];
+static uint16_t ble_svc_hid_dsc_index = 0; // used to store the current index in the dscs array
+static struct ble_gatt_dsc_def ble_svc_hid_dscs[HID_MAX_DSCS];
+static struct ble_gatt_chr_def ble_svc_hid_chrs[HID_MAX_CHRS];
+static struct ble_gatt_svc_def ble_svc_hid_defs[HID_MAX_SVC_INSTANCES];
+static uint16_t ble_svc_hid_chr_index = 0; // used to store the current index in the chrs array
+static uint16_t ble_svc_hid_svc_index = 0; // used to store the current index in the svcs array
+#endif
+
+#if MYNEWT_VAL(BLE_STATIC_TO_DYNAMIC)
+typedef struct {
+    struct ble_svc_hid_params _hid_instances[HID_MAX_SVC_INSTANCES];
+    uint16_t _ble_svc_hid_dsc_index;
+    struct ble_gatt_dsc_def _ble_svc_hid_dscs[HID_MAX_DSCS];
+    struct ble_gatt_chr_def _ble_svc_hid_chrs[HID_MAX_CHRS];
+    struct ble_gatt_svc_def _ble_svc_hid_defs[HID_MAX_SVC_INSTANCES];
+    uint16_t _ble_svc_hid_chr_index;
+    uint16_t _ble_svc_hid_svc_index;
+} ble_svc_hid_static_vars_t;
+
+static ble_svc_hid_static_vars_t * ble_svc_hid_static_vars = NULL;
+
+#define hid_instances (ble_svc_hid_static_vars->_hid_instances)
+#define ble_svc_hid_dsc_index (ble_svc_hid_static_vars->_ble_svc_hid_dsc_index)
+#define ble_svc_hid_dscs (ble_svc_hid_static_vars->_ble_svc_hid_dscs)
+#define ble_svc_hid_chrs (ble_svc_hid_static_vars->_ble_svc_hid_chrs)
+#define ble_svc_hid_defs (ble_svc_hid_static_vars->_ble_svc_hid_defs)
+#define ble_svc_hid_chr_index (ble_svc_hid_static_vars->_ble_svc_hid_chr_index)
+#define ble_svc_hid_svc_index (ble_svc_hid_static_vars->_ble_svc_hid_svc_index)
+
+#endif /* MYNEWT_VAL(BLE_STATIC_TO_DYNAMIC) */
+
+/* Access function */
+static int
+ble_svc_hid_access(uint16_t conn_handle, uint16_t attr_handle,
+                   struct ble_gatt_access_ctxt *ctxt, void *arg);
+
+static int
+ble_svc_hid_chr_write(struct os_mbuf *om, uint16_t min_len,
+                      uint16_t max_len, void *dst,
+                      uint16_t *len)
+{
+    uint16_t om_len;
+    int rc;
+
+    om_len = OS_MBUF_PKTLEN(om);
+    if (om_len < min_len || om_len > max_len) {
+        return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    }
+
+    rc = ble_hs_mbuf_to_flat(om, dst, max_len, len);
+    if (rc != 0) {
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+
+    return 0;
+}
+
+static struct ble_gatt_dsc_def*
+ble_svc_hid_get_dsc(uint8_t num)
+{
+    if (ble_svc_hid_dsc_index + num - 1 >= HID_MAX_DSCS) {
+        return NULL;
+    }
+    ble_svc_hid_dsc_index = ble_svc_hid_dsc_index + num;
+    return &ble_svc_hid_dscs[ble_svc_hid_dsc_index - num];
+}
+
+static struct ble_gatt_chr_def*
+ble_svc_hid_get_chr_block(void)
+{
+    if (ble_svc_hid_chr_index >= HID_MAX_CHRS) {
+        return NULL;
+    }
+    ble_svc_hid_chr_index = ble_svc_hid_chr_index + 1;
+    return &ble_svc_hid_chrs[ble_svc_hid_chr_index - 1];
+}
+
+/*returns current chr index */
+static uint8_t
+ble_svc_hid_get_curr_chr_idx(void)
+{
+    return ble_svc_hid_chr_index;
+}
+
+/*returns current svc index */
+static uint8_t
+get_curr_svc_idx(void)
+{
+    return ble_svc_hid_svc_index;
+}
+
+struct report *
+find_rpt_by_handle(uint16_t handle)
+{
+    uint8_t instance, instances;
+    int i;
+
+    instances = get_curr_svc_idx();
+
+    for (instance = 0; instance < instances; instance++) {
+        for (i = 0; i < hid_instances[instance].rpts_len; i++) {
+            if (hid_instances[instance].rpts[i].handle == handle) {
+                return &hid_instances[instance].rpts[i];
+            }
+        }
+    }
+    /* Report not found */
+    return NULL;
+}
+
+static struct ble_gatt_svc_def*
+ble_svc_get_svc_block(void)
+{
+    if (ble_svc_hid_svc_index >= HID_MAX_SVC_INSTANCES) {
+        return NULL;
+    }
+    ble_svc_hid_svc_index = ble_svc_hid_svc_index + 1;
+    return &ble_svc_hid_defs[ble_svc_hid_svc_index - 1];
+}
+
+/* fill protocol mode char */
+static int
+fill_proto_mode(uint8_t instance)
+{
+    struct ble_gatt_chr_def *chr, demo_chr;
+
+    if (!hid_instances[instance].proto_mode_present) {
+        return 0;
+    }
+    demo_chr = (struct ble_gatt_chr_def) {
+        /*** Protocol Mode characteristic */
+        .uuid = &uuid_proto_mode.u,
+        .access_cb = ble_svc_hid_access,
+        .val_handle = &hid_instances[instance].proto_mode_handle,
+        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE_NO_RSP |
+#if MYNEWT_VAL(BLE_SM_LVL) == 2
+                 BLE_GATT_CHR_F_READ_ENC | BLE_GATT_CHR_F_WRITE_ENC |
+#elif MYNEWT_VAL(BLE_SM_LVL) == 3
+                 BLE_GATT_CHR_F_READ_AUTHEN | BLE_GATT_CHR_F_WRITE_AUTHEN |
+                 BLE_GATT_CHR_F_READ_ENC | BLE_GATT_CHR_F_WRITE_ENC |
+#endif
+                 0,
+    };
+
+    chr = ble_svc_hid_get_chr_block();
+    if (!chr) {
+        BLE_HS_LOG(ERROR, "%s rc=%d\n", __func__, BLE_HS_ENOMEM);
+        return BLE_HS_ENOMEM;
+    }
+    memcpy(chr, &demo_chr, sizeof(struct ble_gatt_chr_def));
+    return 0;
+}
+
+/* fill boot keyboard inp char */
+static int
+fill_boot_kbd_inp(uint8_t instance)
+{
+    struct ble_gatt_chr_def *chr, demo_chr;
+    uint16_t write_flags;
+
+    if (!hid_instances[instance].kbd_inp_present) {
+        return 0;
+    }
+
+    write_flags = BLE_GATT_CHR_F_WRITE |
+#if MYNEWT_VAL(BLE_SM_LVL) == 2
+                  BLE_GATT_CHR_F_WRITE_ENC |
+#elif MYNEWT_VAL(BLE_SM_LVL) == 3
+                  BLE_GATT_CHR_F_WRITE_ENC | BLE_GATT_CHR_F_WRITE_AUTHEN |
+#endif
+                  0;
+    write_flags = (hid_instances[instance].kbd_inp_write_perm ? write_flags : 0);
+
+    demo_chr = (struct ble_gatt_chr_def) {
+        /*** Boot Keyboard Input characteristic */
+        .uuid = &uuid_boot_kbd_inp.u,
+        .access_cb = ble_svc_hid_access,
+        .val_handle = &hid_instances[instance].kbd_inp_handle,
+        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY |
+#if MYNEWT_VAL(BLE_SM_LVL) == 2
+                 BLE_GATT_CHR_F_READ_ENC |
+#elif MYNEWT_VAL(BLE_SM_LVL) == 3
+                 BLE_GATT_CHR_F_READ_AUTHEN |
+                 BLE_GATT_CHR_F_READ_ENC |
+#endif
+                 write_flags,
+    };
+
+    chr = ble_svc_hid_get_chr_block();
+    if (!chr) {
+        BLE_HS_LOG(ERROR, "%s rc=%d\n", __func__, BLE_HS_ENOMEM);
+        return BLE_HS_ENOMEM;
+    }
+    memcpy(chr, &demo_chr, sizeof(struct ble_gatt_chr_def));
+    return 0;
+}
+
+/* fill boot keyboard out char */
+static int
+fill_boot_kbd_out(uint8_t instance)
+{
+    struct ble_gatt_chr_def *chr, demo_chr;
+
+    if (!hid_instances[instance].kbd_out_present) {
+        return 0;
+    }
+    demo_chr = (struct ble_gatt_chr_def) {
+        /*** Boot Keyboard Output characteristic */
+        .uuid = &uuid_boot_kbd_out.u,
+        .access_cb = ble_svc_hid_access,
+        .val_handle = &hid_instances[instance].kbd_out_handle,
+        .flags = BLE_GATT_CHR_F_READ |
+                 BLE_GATT_CHR_F_WRITE_NO_RSP | BLE_GATT_CHR_F_WRITE |
+#if MYNEWT_VAL(BLE_SM_LVL) == 2
+                 BLE_GATT_CHR_F_READ_ENC | BLE_GATT_CHR_F_WRITE_ENC |
+#elif MYNEWT_VAL(BLE_SM_LVL) == 3
+                 BLE_GATT_CHR_F_READ_AUTHEN | BLE_GATT_CHR_F_WRITE_AUTHEN |
+                 BLE_GATT_CHR_F_READ_ENC | BLE_GATT_CHR_F_WRITE_ENC |
+#endif
+                 0,
+    };
+
+    chr = ble_svc_hid_get_chr_block();
+    if (!chr) {
+        BLE_HS_LOG(ERROR, "%s rc=%d\n", __func__, BLE_HS_ENOMEM);
+        return BLE_HS_ENOMEM;
+    }
+    memcpy(chr, &demo_chr, sizeof(struct ble_gatt_chr_def));
+    return 0;
+}
+/* fill boot mouse inp char */
+static void
+fill_boot_mouse_inp(uint8_t instance)
+{
+    struct ble_gatt_chr_def *chr, demo_chr;
+    uint16_t write_flags;
+
+    if (!hid_instances[instance].mouse_inp_present) {
+        return;
+    }
+
+    write_flags = BLE_GATT_CHR_F_WRITE |
+#if MYNEWT_VAL(BLE_SM_LVL) == 2
+                  BLE_GATT_CHR_F_WRITE_ENC |
+#elif MYNEWT_VAL(BLE_SM_LVL) == 3
+                  BLE_GATT_CHR_F_WRITE_ENC | BLE_GATT_CHR_F_WRITE_AUTHEN |
+#endif
+                  0;
+    write_flags = (hid_instances[instance].mouse_inp_write_perm ? write_flags : 0);
+
+    demo_chr = (struct ble_gatt_chr_def) {
+        /*** Boot Mouse Input characteristic */
+        .uuid = &uuid_boot_mouse_inp.u,
+        .access_cb = ble_svc_hid_access,
+        .val_handle = &hid_instances[instance].mouse_inp_handle,
+        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY |
+#if MYNEWT_VAL(BLE_SM_LVL) == 2
+                 BLE_GATT_CHR_F_READ_ENC |
+#elif MYNEWT_VAL(BLE_SM_LVL) == 3
+                 BLE_GATT_CHR_F_READ_AUTHEN |
+                 BLE_GATT_CHR_F_READ_ENC |
+#endif
+                 write_flags,
+    };
+
+    chr = ble_svc_hid_get_chr_block();
+    if (!chr) {
+        return;
+    }
+    memcpy(chr, &demo_chr, sizeof(struct ble_gatt_chr_def));
+}
+/* create report map char */
+static int
+fill_rpt_map(uint8_t instance)
+{
+    struct ble_gatt_chr_def *chr, demo_chr;
+    struct ble_gatt_dsc_def *dsc;
+    struct ble_gatt_dsc_def *demo_dsc = (struct ble_gatt_dsc_def[]) {
+        {
+            /* External Report Reference descriptor */
+            .uuid = &uuid_ext_rpt_ref.u,
+            .access_cb = ble_svc_hid_access,
+            .att_flags = BLE_ATT_F_READ,
+            .arg = &hid_instances[instance].report_map_handle,
+        }, {
+            0,
+        }
+    };
+    demo_chr = (struct ble_gatt_chr_def) {
+        /*** Report Map characteristic */
+        .uuid = &uuid_report_map.u,
+        .access_cb = ble_svc_hid_access,
+        .val_handle = &hid_instances[instance].report_map_handle,
+        .flags = BLE_GATT_CHR_F_READ |
+#if MYNEWT_VAL(BLE_SM_LVL) == 2
+                 BLE_GATT_CHR_F_READ_ENC |
+#elif MYNEWT_VAL(BLE_SM_LVL) == 3
+                 BLE_GATT_CHR_F_READ_AUTHEN |
+                 BLE_GATT_CHR_F_READ_ENC |
+#endif
+                 0,
+    };
+    /* logic : allocate the discriptor needed and then allocate one more and assign 0 to it,
+    this is done to indicate there are no more descriptors */
+    dsc = ble_svc_hid_get_dsc(2);
+    if (!dsc) {
+        BLE_HS_LOG(ERROR, "%s rc=%d\n", __func__, BLE_HS_ENOMEM);
+        return BLE_HS_ENOMEM;
+    }
+    memcpy(dsc, demo_dsc, 2 * sizeof(struct ble_gatt_dsc_def));
+
+    demo_chr.descriptors = dsc;
+    chr = ble_svc_hid_get_chr_block();
+    if (!chr) {
+        BLE_HS_LOG(ERROR, "%s rc=%d\n", __func__, BLE_HS_ENOMEM);
+        return BLE_HS_ENOMEM;
+    }
+    memcpy(chr, &demo_chr, sizeof(struct ble_gatt_chr_def));
+    return 0;
+}
+
+/* create report chars */
+static int
+fill_reports(uint8_t instance)
+{
+    struct ble_gatt_chr_def *chr, demo_chr;
+    struct ble_gatt_dsc_def *dsc;
+    int i;
+    struct ble_gatt_dsc_def *demo_dsc = (struct ble_gatt_dsc_def[]) {
+        {
+            /* Report Reference descriptor */
+            .uuid = &uuid_rpt_ref.u,
+            .access_cb = ble_svc_hid_access,
+            .att_flags = BLE_ATT_F_READ
+        }, {
+            0,
+        }
+    };
+    demo_chr = (struct ble_gatt_chr_def) {
+        /*** Report characteristic */
+        .uuid = &uuid_report.u,
+        .access_cb = ble_svc_hid_access,
+    };
+    /* Multiple instances of this characteristic are allowed*/
+    for (i = 0; i < hid_instances[instance].rpts_len; i++) {
+        /* logic : allocate the discriptor needed and then allocate one more and assign 0 to it,
+        this is done to indicate there are no more descriptors */
+        dsc = ble_svc_hid_get_dsc(2);
+        if (!dsc) {
+            BLE_HS_LOG(ERROR, "%s rc=%d\n", __func__, BLE_HS_ENOMEM);
+            return BLE_HS_ENOMEM;
+        }
+        demo_dsc[0].arg = &hid_instances[instance].rpts[i].handle;
+        memcpy(dsc, demo_dsc, 2 * sizeof(struct ble_gatt_dsc_def));
+
+        switch (hid_instances[instance].rpts[i].type) {
+        case BLE_SVC_HID_RPT_TYPE_INPUT:
+            demo_chr.flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_WRITE;
+            break;
+        case BLE_SVC_HID_RPT_TYPE_OUTPUT:
+            demo_chr.flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP;
+            break;
+        case BLE_SVC_HID_RPT_TYPE_FEATURE:
+            demo_chr.flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE;
+            break;
+        default :
+            assert(0);
+            break;
+        }
+        demo_chr.flags |= (
+#if MYNEWT_VAL(BLE_SM_LVL) == 2
+                              BLE_GATT_CHR_F_READ_ENC | BLE_GATT_CHR_F_WRITE_ENC |
+#elif MYNEWT_VAL(BLE_SM_LVL) == 3
+                              BLE_GATT_CHR_F_READ_AUTHEN | BLE_GATT_CHR_F_WRITE_AUTHEN |
+                              BLE_GATT_CHR_F_READ_ENC | BLE_GATT_CHR_F_WRITE_ENC |
+#endif
+                              0);
+        demo_chr.val_handle = &hid_instances[instance].rpts[i].handle;
+        demo_chr.descriptors = dsc;
+
+        chr = ble_svc_hid_get_chr_block();
+        if (!chr) {
+            BLE_HS_LOG(ERROR, "%s rc=%d\n", __func__, BLE_HS_ENOMEM);
+            return BLE_HS_ENOMEM;
+        }
+        memcpy(chr, &demo_chr, sizeof(struct ble_gatt_chr_def));
+    }
+
+    return 0;
+}
+
+static void
+fill_hid_info(uint8_t instance)
+{
+    struct ble_gatt_chr_def *chr, demo_chr;
+
+    demo_chr = (struct ble_gatt_chr_def) {
+        /*** HID Information Characteristic */
+        .uuid = &uuid_hid_info.u,
+        .access_cb = ble_svc_hid_access,
+        .val_handle = &hid_instances[instance].hid_info_handle,
+        .flags = BLE_GATT_CHR_F_READ |
+#if MYNEWT_VAL(BLE_SM_LVL) == 2
+                 BLE_GATT_CHR_F_READ_ENC |
+#elif MYNEWT_VAL(BLE_SM_LVL) == 3
+                 BLE_GATT_CHR_F_READ_AUTHEN |
+                 BLE_GATT_CHR_F_READ_ENC |
+#endif
+                 0,
+    };
+    chr = ble_svc_hid_get_chr_block();
+    if (!chr) {
+        return;
+    }
+    memcpy(chr, &demo_chr, sizeof(struct ble_gatt_chr_def));
+}
+
+static void
+fill_ctrl_pt(uint8_t instance)
+{
+    struct ble_gatt_chr_def *chr, demo_chr;
+
+    demo_chr = (struct ble_gatt_chr_def) {
+        /*** HID Control Point Characteristic */
+        .uuid = &uuid_hid_ctrl_pt.u,
+        .access_cb = ble_svc_hid_access,
+        .val_handle = &hid_instances[instance].ctrl_pt_handle,
+        .flags = BLE_GATT_CHR_F_WRITE_NO_RSP |
+#if MYNEWT_VAL(BLE_SM_LVL) == 2
+                 BLE_GATT_CHR_F_WRITE_ENC |
+#elif MYNEWT_VAL(BLE_SM_LVL) == 3
+                 BLE_GATT_CHR_F_WRITE_AUTHEN |
+                 BLE_GATT_CHR_F_WRITE_ENC |
+#endif
+                 0,
+    };
+    chr = ble_svc_hid_get_chr_block();
+    if (!chr) {
+        return;
+    }
+    memcpy(chr, &demo_chr, sizeof(struct ble_gatt_chr_def));
+}
+
+/**
+ * allocating one more chr block with
+ * value set to zero
+ */
+static int
+ble_svc_hid_end_chrs(void)
+{
+    struct ble_gatt_chr_def *chr;
+    chr = ble_svc_hid_get_chr_block();
+    if (chr == NULL) {
+        BLE_HS_LOG(ERROR, "%s rc=%d\n", __func__, BLE_HS_ENOMEM);
+        return BLE_HS_ENOMEM;
+    }
+    memset(chr, 0, sizeof(struct ble_gatt_chr_def));
+    return 0;
+}
+/**
+ * HID access function
+ */
+static int
+ble_svc_hid_access(uint16_t conn_handle, uint16_t attr_handle,
+                   struct ble_gatt_access_ctxt *ctxt,
+                   void *arg)
+{
+    uint16_t uuid16;
+    if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR || ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
+        uuid16 = ble_uuid_u16(ctxt->chr->uuid);
+    } else {
+        uuid16 = ble_uuid_u16(ctxt->dsc->uuid);
+    }
+    int rc;
+    struct report *rpt;
+    uint16_t rpt_ref_val = 0;
+    uint16_t out_rpt_len = 0;
+    uint8_t instances = get_curr_svc_idx();
+    uint16_t handle;
+    uint8_t val;
+
+    for (int instance = 0; instance < instances; instance++) {
+        switch (uuid16) {
+        case BLE_SVC_HID_CHR_UUID16_REPORT_MAP:
+            if (hid_instances[instance].report_map_handle != attr_handle) {
+                continue;
+            }
+            assert(ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR);
+            rc = os_mbuf_append(ctxt->om, &hid_instances[instance].report_map,
+                                hid_instances[instance].report_map_len);
+            return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+        case BLE_SVC_HID_DSC_UUID16_EXT_RPT_REF:
+            handle = *(uint16_t*)(ctxt->dsc->arg);
+            if (hid_instances[instance].report_map_handle != handle) {
+                continue;
+            }
+            assert(ctxt->op == BLE_GATT_ACCESS_OP_READ_DSC);
+            rc = os_mbuf_append(ctxt->om, &hid_instances[instance].external_rpt_ref,
+                                sizeof hid_instances[instance].external_rpt_ref);
+            return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+        case BLE_SVC_HID_DSC_UUID16_RPT_REF:
+            /* this will work without having any instance check
+            because find_rpt_by_handle already checks for the instance */
+            assert(ctxt->op == BLE_GATT_ACCESS_OP_READ_DSC);
+            rpt = find_rpt_by_handle(*(uint16_t *)ctxt->dsc->arg);
+            if (rpt == NULL) {
+                return BLE_ATT_ERR_ATTR_NOT_FOUND;
+            }
+            rpt_ref_val = (0x00FF & rpt->id) | ((0x00FF & (uint16_t)rpt->type) << 8); /* check if this should be opposite */
+            rc = os_mbuf_append(ctxt->om, &rpt_ref_val,
+                                sizeof rpt_ref_val);
+            return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+
+        case BLE_SVC_HID_CHR_UUID16_HID_INFO:
+            if (hid_instances[instance].hid_info_handle != attr_handle) {
+                continue;
+            }
+            assert(ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR);
+            rc = os_mbuf_append(ctxt->om, &hid_instances[instance].hid_info,
+                                sizeof hid_instances[instance].hid_info);
+            return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+
+        case BLE_SVC_HID_CHR_UUID16_HID_CTRL_PT:
+            if (hid_instances[instance].ctrl_pt_handle != attr_handle) {
+                continue;
+            }
+            assert(ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR);
+            /* check if the value is correct */
+            rc = ble_hs_mbuf_to_flat(ctxt->om, &val, sizeof(uint8_t), NULL);
+            if(rc != 0) {
+                return BLE_ATT_ERR_INSUFFICIENT_RES;
+            }
+            if(val == 0 || val == 1) {
+                rc = ble_svc_hid_chr_write(ctxt->om, 0, sizeof hid_instances[instance].ctrl_pt, &hid_instances[instance].ctrl_pt, NULL);
+                if (rc == 0 && conn_handle != BLE_HS_CONN_HANDLE_NONE &&
+                        s_char_write_cb) {
+                    s_char_write_cb(attr_handle, BLE_SVC_HID_CHR_UUID16_HID_CTRL_PT, hid_instances[instance].ctrl_pt);
+                }
+                return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+            }
+            return BLE_ATT_ERR_UNLIKELY;
+
+        case BLE_SVC_HID_CHR_UUID16_BOOT_KBD_OUT:
+            if (hid_instances[instance].kbd_out_handle != attr_handle) {
+                continue;
+            }
+            assert(ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR || ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR);
+            if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
+                rc = os_mbuf_append(ctxt->om, &hid_instances[instance].kbd_out_rpt,
+                                    sizeof(hid_instances[instance].kbd_out_rpt));
+                return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+            } else if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
+                rc = ble_svc_hid_chr_write(ctxt->om, 0, sizeof(hid_instances[instance].kbd_out_rpt),
+                                           &hid_instances[instance].kbd_out_rpt, &out_rpt_len);
+                if (rc == 0 && conn_handle != BLE_HS_CONN_HANDLE_NONE &&
+                        s_report_write_cb) {
+                    s_report_write_cb(attr_handle, BLE_SVC_HID_RPT_TYPE_OUTPUT, 0,
+                                      &hid_instances[instance].kbd_out_rpt,
+                                      out_rpt_len);
+                }
+                return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+            }
+            return 0;
+        case BLE_SVC_HID_CHR_UUID16_BOOT_KBD_INP:
+            if (hid_instances[instance].kbd_inp_handle != attr_handle) {
+                continue;
+            }
+            assert(ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR || ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR);
+            if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
+                rc = os_mbuf_append(ctxt->om, &hid_instances[instance].kbd_inp_rpt,
+                                    sizeof(hid_instances[instance].kbd_inp_rpt));
+                return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+            } else if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
+                rc = ble_svc_hid_chr_write(ctxt->om, 0, sizeof(hid_instances[instance].kbd_inp_rpt), hid_instances[instance].kbd_inp_rpt, NULL);
+                if (ctxt->chr->flags & BLE_GATT_CHR_F_NOTIFY) {
+                    ble_gatts_chr_updated(*(ctxt->chr->val_handle));
+                }
+                return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+            }
+            return 0;
+        case BLE_SVC_HID_CHR_UUID16_BOOT_MOUSE_INP:
+            if (hid_instances[instance].mouse_inp_handle != attr_handle) {
+                continue;
+            }
+            assert(ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR || ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR);
+            if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
+                rc = os_mbuf_append(ctxt->om, &hid_instances[instance].mouse_inp_rpt,
+                                    hid_instances[instance].mouse_inp_rpt_len);
+                return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+            } else if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
+                rc = ble_svc_hid_chr_write(ctxt->om, 0, sizeof(hid_instances[instance].mouse_inp_rpt), hid_instances[instance].mouse_inp_rpt, &out_rpt_len);
+                if (rc != 0) {
+                    return BLE_ATT_ERR_INSUFFICIENT_RES;
+                }
+                hid_instances[instance].mouse_inp_rpt_len = out_rpt_len;
+                if (ctxt->chr->flags & BLE_GATT_CHR_F_NOTIFY) {
+                    ble_gatts_chr_updated(*(ctxt->chr->val_handle));
+                }
+                return 0;
+            }
+            return 0;
+        case BLE_SVC_HID_CHR_UUID16_PROTOCOL_MODE:
+            if (hid_instances[instance].proto_mode_handle != attr_handle) {
+                continue;
+            }
+            assert(ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR || ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR);
+            if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
+                rc = os_mbuf_append(ctxt->om, &hid_instances[instance].proto_mode,
+                                    sizeof(hid_instances[instance].proto_mode));
+                return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+            } else if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
+                /* check if the value is correct */
+                rc = ble_hs_mbuf_to_flat(ctxt->om, &val, sizeof(uint8_t), NULL);
+                if(rc != 0) {
+                    return BLE_ATT_ERR_INSUFFICIENT_RES;
+                }
+                if(val == 0 || val == 1) {
+                    rc = ble_svc_hid_chr_write(ctxt->om, 0, sizeof(hid_instances[instance].proto_mode), &hid_instances[instance].proto_mode, NULL);
+                    if (rc == 0 && conn_handle != BLE_HS_CONN_HANDLE_NONE &&
+                            s_char_write_cb) {
+                        s_char_write_cb(attr_handle, BLE_SVC_HID_CHR_UUID16_PROTOCOL_MODE, hid_instances[instance].proto_mode);
+                    }
+                    return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+                }
+                return BLE_ATT_ERR_UNLIKELY;
+            }
+            return 0;
+        case BLE_SVC_HID_CHR_UUID16_RPT:
+            /* this will work without any check of instance */
+            rpt = find_rpt_by_handle(*(ctxt->chr->val_handle));
+            if (rpt == NULL) {
+                return BLE_ATT_ERR_ATTR_NOT_FOUND;
+            }
+            assert(ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR || ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR);
+            if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
+                rc = os_mbuf_append(ctxt->om, rpt->data,
+                                    rpt->len);
+                return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+            } else if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
+                rc = ble_svc_hid_chr_write(ctxt->om, 0, RPT_MAX_LEN, rpt->data, &out_rpt_len);
+                if (rc != 0) {
+                    return BLE_ATT_ERR_INSUFFICIENT_RES;
+                }
+                rpt->len = out_rpt_len;
+                if (conn_handle != BLE_HS_CONN_HANDLE_NONE && s_report_write_cb) {
+                    s_report_write_cb(attr_handle, rpt->type, rpt->id, rpt->data, rpt->len);
+                }
+                if (ctxt->chr->flags & BLE_GATT_CHR_F_NOTIFY) {
+                    ble_gatts_chr_updated(*(ctxt->chr->val_handle));
+                }
+                return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+            }
+            return 0;
+
+        default:
+            assert(0);
+            return BLE_ATT_ERR_UNLIKELY;
+        }
+    }
+    return BLE_ATT_ERR_UNLIKELY;
+}
+
+/* can be called multiple times */
+int
+ble_svc_hid_add(struct ble_svc_hid_params params)
+{
+    /* Ensure this function only gets called by sysinit. */
+    SYSINIT_ASSERT_ACTIVE();
+
+    uint8_t svc_idx;
+    int rc = 0;
+    struct ble_gatt_svc_def *svc;
+    uint8_t chr_idx;
+
+#if MYNEWT_VAL(BLE_STATIC_TO_DYNAMIC)
+    if (ble_svc_hid_static_vars == NULL) {
+        ble_svc_hid_static_vars = nimble_platform_mem_calloc(1, sizeof(ble_svc_hid_static_vars_t));
+        if (ble_svc_hid_static_vars == NULL) {
+            rc = BLE_HS_ENOMEM;
+            goto error;
+        }
+    }
+#endif
+
+    svc_idx = get_curr_svc_idx();
+    /* one instance is required for empty service */
+    if (HID_MAX_SVC_INSTANCES  - 1 <= svc_idx) {
+        /* increase instances count */
+        rc = BLE_HS_ENOMEM;
+        goto error;
+    }
+
+    if (params.rpts_len > MYNEWT_VAL(BLE_SVC_HID_MAX_RPTS)) {
+        rc = BLE_HS_EINVAL;
+        goto error;
+    }
+
+    memcpy(&hid_instances[svc_idx], &params, sizeof(struct ble_svc_hid_params));
+
+    /* get the pointer to the first characteristic */
+    chr_idx = ble_svc_hid_get_curr_chr_idx();
+
+    /* Fill protocol mode characteristic */
+    rc = fill_proto_mode(svc_idx);
+    if (rc != 0) {
+        goto error;
+    }
+    /* Fill report map characteristic */
+    rc = fill_rpt_map(svc_idx);
+    if (rc != 0) {
+        goto error;
+    }
+    /* Fill report characteristics */
+    rc = fill_reports(svc_idx);
+    if (rc !=0 ) {
+        goto error;
+    }
+    /* Fill the boot keyboard input characteristic */
+    rc = fill_boot_kbd_inp(svc_idx);
+    if (rc != 0) {
+        goto error;
+    }
+    /* Fill the boot keyboard output characteristic */
+    rc = fill_boot_kbd_out(svc_idx);
+    if (rc != 0) {
+        goto error;
+    }
+    /* Fill the boot mouse input characteristic */
+    fill_boot_mouse_inp(svc_idx);
+    /* Fill the hid info characteristic */
+    fill_hid_info(svc_idx);
+    /* Fill the control point characteristic */
+    fill_ctrl_pt(svc_idx);
+    /* End the characteristics with the characteristic with empty block */
+    rc = ble_svc_hid_end_chrs();
+    if (rc != 0){
+        goto error;
+    }
+
+    svc = ble_svc_get_svc_block();
+    if (svc == NULL) {
+        rc = BLE_HS_ENOMEM;
+        goto error;
+    }
+    svc->type = BLE_GATT_SVC_TYPE_PRIMARY;
+    svc->uuid = &uuid_hid_svc.u;
+    svc->characteristics = ble_svc_hid_chrs + chr_idx;
+
+    return 0;
+error:
+#if MYNEWT_VAL(BLE_STATIC_TO_DYNAMIC)
+    ble_svc_hid_reset();
+#endif
+    return rc;
+}
+
+/**
+ * Allocating one more svc block
+ * with value set to 0
+ */
+static int
+ble_svc_hid_end(void)
+{
+    struct ble_gatt_svc_def *svc;
+
+    svc = ble_svc_get_svc_block();
+    if (svc == NULL) {
+        BLE_HS_LOG(ERROR, "%s rc=%d\n", __func__, BLE_HS_ENOMEM);
+        return BLE_HS_ENOMEM;
+    }
+    memset(svc, 0, sizeof(struct ble_gatt_svc_def));
+    return 0;
+}
+
+/**
+ * If the ble_gatts_reset() is called after ble_svc_hid_init(),
+   call ble_svc_hid_reset() to reinitialize the service.
+ */
+void
+ble_svc_hid_reset(void)
+{
+#if MYNEWT_VAL(BLE_STATIC_TO_DYNAMIC)
+    if (ble_svc_hid_static_vars == NULL) {
+        return;
+    }
+#endif
+
+    ble_svc_hid_dsc_index = 0;
+    ble_svc_hid_chr_index = 0;
+    ble_svc_hid_svc_index = 0;
+
+#if MYNEWT_VAL(BLE_STATIC_TO_DYNAMIC)
+    if (ble_svc_hid_static_vars != NULL) {
+        nimble_platform_mem_free(ble_svc_hid_static_vars);
+        ble_svc_hid_static_vars = NULL;
+    }
+#endif
+}
+
+void
+ble_svc_hid_deinit(void)
+{
+    ble_gatts_free_svcs();
+}
+
+/**
+ * Initialize the HID Service.
+ */
+void
+ble_svc_hid_init(void)
+{
+    int rc;
+
+    /* Ensure this function only gets called by sysinit. */
+    SYSINIT_ASSERT_ACTIVE();
+
+    rc = ble_svc_hid_end();
+    SYSINIT_PANIC_ASSERT(rc == 0);
+
+    rc = ble_gatts_count_cfg(ble_svc_hid_defs);
+    SYSINIT_PANIC_ASSERT(rc == 0);
+
+    rc = ble_gatts_add_svcs(ble_svc_hid_defs);
+    SYSINIT_PANIC_ASSERT(rc == 0);
+
+}
+
+void
+ble_svc_hid_register_report_write_cb(ble_svc_hid_report_write_cb_t cb)
+{
+    s_report_write_cb = cb;
+}
+
+void
+ble_svc_hid_register_char_write_cb(ble_svc_hid_char_write_cb_t cb)
+{
+    s_char_write_cb = cb;
+}
+#endif
+#endif // CONFIG_BT_NIMBLE_HID_SERVICE
