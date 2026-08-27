@@ -1,6 +1,7 @@
 #include "lhdc_entropy_dec.h"
 #include "lhdc_bit_reader.h"
 #include "lhdc_tables.h"
+#include "lhdc_dec_slot.h"   /* LHDC_NSLOTS / LHDC_DEC_SLOT(): parallel channel decode */
 #include <string.h>
 #include <stdlib.h>   /* malloc/free for the lazily-heaped FAC models */
 #if defined(LHDC_HOST_BUILD)
@@ -26,7 +27,6 @@
 #define LHDC_ALWAYS_INLINE __attribute__((always_inline)) inline
 #define LHDC_NOINLINE      __attribute__((noinline))
 
-
 /*
  * LHDC V5 entropy decoder — reverse-engineered and validated bit-exact against
  * the real liblhdcv5.so encoder (range coder 50/50, Rice 20000/20000 round-trip,
@@ -51,7 +51,9 @@
 int g_fdc = 0;     /* per-channel DSTATE symbol counter (reset each entropy call) */
 int g_block = 0;   /* which channel-block since trace start (0=a-ch0,1=a-ch1,2=b-ch0,...) */
 #endif
-uint32_t g_fac_final_range = 0;   /* final range register after entropy decode (leftover analysis) */
+/* Per-slot (per-core): the two channels decode concurrently on the classic
+ * ESP32, and each reads back its own final range in lhdc_dec.c. */
+uint32_t g_fac_final_range[LHDC_NSLOTS] = {0};
 
 static const uint32_t FAC_FQ1[FAC_NSYM] = {54, 12, 1};
 static const uint32_t FAC_FQ2[FAC_NSYM] = {90, 16, 1};
@@ -81,14 +83,19 @@ typedef struct {
  * ~2.5 KB of pure waste (it only ever uses ma_win1 entries). Right-sizing frees
  * that .bss -> the heap pool is ~2.5 KB larger during ALL LHDC playback (96k and
  * 48k). s_fac_m[0] = stream-1, s_fac_m[1] = stream-2. */
-static uint8_t s_fac_hist1[512];    /* stream-1 (ma_win1) */
-static uint8_t s_fac_hist2[3072];   /* stream-2 (ma_win2, win1*8) */
-static fac_model_t s_fac_m[2];
+/* One set PER SLOT: the range coder's adaptive state is mutated on every symbol,
+ * so two channels decoding at once (one per core) must not share it. */
+static uint8_t s_fac_hist1[LHDC_NSLOTS][512];    /* stream-1 (ma_win1) */
+static uint8_t s_fac_hist2[LHDC_NSLOTS][3072];   /* stream-2 (ma_win2, win1*8) */
+static fac_model_t s_fac_m[LHDC_NSLOTS][2];
 
 void lhdc_entropy_alloc_internal(void)
 {
-    s_fac_m[0].hist = s_fac_hist1; s_fac_m[0].hist_cap = (int)sizeof(s_fac_hist1);
-    s_fac_m[1].hist = s_fac_hist2; s_fac_m[1].hist_cap = (int)sizeof(s_fac_hist2);
+    /* Only THIS core's slot: called per channel decode, so touching the other
+     * slot here would write model state the other core is actively using. */
+    const int s = LHDC_DEC_SLOT();
+    s_fac_m[s][0].hist = s_fac_hist1[s]; s_fac_m[s][0].hist_cap = (int)sizeof(s_fac_hist1[s]);
+    s_fac_m[s][1].hist = s_fac_hist2[s]; s_fac_m[s][1].hist_cap = (int)sizeof(s_fac_hist2[s]);
 }
 
 void lhdc_entropy_alloc(void) { /* no-op: models are static .bss */ }
@@ -413,7 +420,7 @@ static LHDC_HOT void rice_decode_coeffs_used(const uint8_t *s1, s2_lazy_t *z,
  * split / windows / sign-plane offset through to here; this function exposes the
  * validated core. lhdc_entropy_decode_spectrum below adapts the legacy call.
  */
-lhdc_dec_ret_t lhdc_entropy_decode_spectrum_ex2(int32_t *quant_spectrum,
+LHDC_HOT lhdc_dec_ret_t lhdc_entropy_decode_spectrum_ex2(int32_t *quant_spectrum,
                                                  int num_coeffs,
                                                  lhdc_dec_bit_reader_t *br,
                                                  int count, int split,
@@ -444,8 +451,9 @@ lhdc_dec_ret_t lhdc_entropy_decode_spectrum_ex2(int32_t *quant_spectrum,
     fac_dec_t d;
     fac_dec_init(&d, facbuf, nb);
 
-    fac_model_t *const pm1 = &s_fac_m[0];   /* stream-1 model (.bss) */
-    fac_model_t *const pm2 = &s_fac_m[1];   /* stream-2 model (.bss) */
+    const int slot = LHDC_DEC_SLOT();       /* this core's private model set */
+    fac_model_t *const pm1 = &s_fac_m[slot][0];   /* stream-1 model (.bss) */
+    fac_model_t *const pm2 = &s_fac_m[slot][1];   /* stream-2 model (.bss) */
     lhdc_entropy_alloc_internal();          /* point pm1/pm2 at their right-sized hist buffers (idempotent) */
 
     fac_model_init(pm1, FAC_FQ1, ma_win1 > 0 ? ma_win1 : 256);
@@ -497,7 +505,7 @@ lhdc_dec_ret_t lhdc_entropy_decode_spectrum_ex2(int32_t *quant_spectrum,
         s2_state_after(&z, s2_used, &consumed, &final_range);
         if (consumed < 0) consumed = 0;
         *fac_bytes_out = consumed;            /* raw bytes pulled */
-        g_fac_final_range = final_range;      /* leftover rule applied in lhdc_dec.c */
+        g_fac_final_range[slot] = final_range;      /* leftover rule applied in lhdc_dec.c */
 #if defined(LHDC_HOST_BUILD)
         if (getenv("LHDC_LEFTOVER_LOG"))
             printf("[LEFTOVER] consumed=%d range=%08x s2_used=%d rule=%d\n",

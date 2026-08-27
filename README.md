@@ -458,6 +458,37 @@ Xtensa LX6-specific optimizations applied:
   instruction.
 - Twiddle tables live in DRAM/IRAM (never flash) because they are read thousands of times
   per frame.
+- The synthesis window is **structured, not streamed**. It is a low-overlap design in which
+  63% of the coefficients are exactly `0.0` or exactly `1.0`, and the second half is the
+  first half reversed (`w[N-1-n] == w[n]` bit-exactly for N = 480/960/1920). Overlap-add
+  therefore multiplies only across the transition ramp -- 352 of 960 samples at 192 kHz --
+  and the zero/unity runs become `memcpy`/`memset`/plain adds. Only the ramp needs to be
+  resident (1408 B at 192 kHz instead of a 7680 B window), and it is copied into DRAM so
+  the per-frame overlap-add performs **no flash accesses at all**. The structure is verified
+  against the actual table at runtime; if a window ever fails the check the decoder falls
+  back to the general loop, so the optimization can cost speed but never correctness.
+- The component builds at `-O3` regardless of the project's global optimization level
+  (see `CMakeLists.txt`). Measured on a 240 MHz classic ESP32 at 192 kHz/24-bit: IMDCT
+  795 us -> 626 us per channel, whole frame 2545 us -> 2163 us.
+
+### Where the time goes (192 kHz / 24-bit, classic ESP32 @ 240 MHz)
+
+Per channel, per 5 ms frame, measured on-device with dense program material:
+
+| stage | us | notes |
+|---|---:|---|
+| entropy (FAC range coder) | ~380 | scales with **bitrate**, not sample rate |
+| IMDCT (N=1920 fast path) | ~440 | four-step FFT, tables in DRAM |
+| inverse quantize + SNS | ~150 | one `exp2f`, then table lookups |
+| mantissa plane | ~98 | batched 4-byte bit-field reads |
+| window + overlap-add | ~40 | structured window (was ~326 before) |
+| header + SNS side info | ~22 | |
+
+Both channels run sequentially on one core, so a frame costs roughly twice these
+figures. Note the classic ESP32 has only ~82-135 KB of *byte-addressable* DRAM
+depending on the module, and it is the same pool the Bluetooth media allocator draws
+from -- see [Memory model](#memory-model) before sizing an output ring alongside this
+decoder at 192 kHz.
 
 ---
 
