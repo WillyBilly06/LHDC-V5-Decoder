@@ -1,0 +1,5 @@
+# ESP32-S31-N16R16V (16 MB flash) — single large app, room for the full codec set
+# Name,   Type, SubType, Offset,  Size
+nvs,      data, nvs,     0x9000,  0x6000,
+phy_init, data, phy,     0xf000,  0x1000,
+factory,  app,  factory, 0x10000, 0x400000,
