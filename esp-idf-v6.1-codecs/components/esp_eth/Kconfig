@@ -1,0 +1,181 @@
+menu "Ethernet"
+
+    # Invisible item that is enabled if any Ethernet selection is made
+    config ETH_ENABLED
+        bool
+
+    menuconfig ETH_USE_ESP32_EMAC
+        depends on SOC_EMAC_SUPPORTED
+        bool "Support ESP32 internal EMAC controller"
+        default y
+        select ETH_ENABLED
+        help
+            ESP32 integrates a 10/100M Ethernet MAC controller.
+
+    if ETH_USE_ESP32_EMAC
+        config ETH_DMA_BUFFER_SIZE
+            int "Ethernet DMA buffer size (Byte)"
+            range 256 1600
+            default 512
+            help
+                Set the size of each buffer used by Ethernet MAC DMA.
+                !! Important !! Make sure it is 64B aligned for ESP32P4/S31!
+
+        config ETH_DMA_RX_BUFFER_NUM
+            int "Amount of Ethernet DMA Rx buffers"
+            range 3 30
+            default 10 if IDF_TARGET_ESP32 #ESP32 has bigger internal Rx FIFO
+            default 20
+            help
+                Number of DMA receive buffers. Each buffer's size is ETH_DMA_BUFFER_SIZE.
+                Larger number of buffers could increase throughput somehow.
+
+        config ETH_DMA_TX_BUFFER_NUM
+            int "Amount of Ethernet DMA Tx buffers"
+            range 3 30
+            default 10
+            help
+                Number of DMA transmit buffers. Each buffer's size is ETH_DMA_BUFFER_SIZE.
+                Larger number of buffers could increase throughput somehow.
+
+        if ETH_DMA_RX_BUFFER_NUM > 15
+            config ETH_SOFT_FLOW_CONTROL
+                bool "Enable software flow control"
+                default n
+                help
+                    Ethernet MAC engine on ESP32 doesn't feature a flow control logic.
+                    The MAC driver can perform a software flow control if you enable this option.
+                    Note that, if the RX buffer number is small, enabling software flow control will
+                    cause obvious performance loss.
+        endif
+
+        config ETH_IRAM_OPTIMIZATION
+            bool "Enable IRAM optimization"
+            default n
+            help
+                If enabled, functions related to RX/TX are placed into IRAM. It can improve Ethernet throughput.
+                If disabled, all functions are placed into FLASH.
+
+        menu "Ethernet Time"
+            depends on SOC_EMAC_IEEE1588V2_SUPPORTED
+
+            config ETH_CLOCK_ADJTIME_PERIOD_MS
+                int "Period over which adjtime() applies corrections (ms)"
+                default 1000
+                range 100 10000
+                help
+                    The time period over which a clock_adjtime() correction is applied
+                    by adjusting the hardware clock rate. The PTP clock's tick rate (ppb)
+                    is computed as: ppb = delta_ns * 1000 / ETH_CLOCK_ADJTIME_PERIOD_MS.
+
+            config ETH_CLOCK_ADJTIME_SLEWLIMIT_PPB
+                int "Maximum clock slew rate (ppb)"
+                default 500000
+                range 1000 5000000
+                help
+                    Drift estimates exceeding this limit (in ppb) are rejected as
+                    out of range. Typical crystal oscillators drift less than 50 ppm
+                    (50000 ppb).
+        endmenu
+
+        menu "Ethernet Clock"
+            choice ETH_EMAC_PHY_REF_CLK_SRC
+                prompt "PHY reference clock source"
+                depends on !SOC_EMAC_RMII_CLK_OUT_INTERNAL_LOOPBACK
+                default ETH_EMAC_PHY_REF_CLK_SRC_AUTO
+                help
+                    Select the PLL clock source used to drive the PHY reference clock output
+                    (PLL_F50M). This applies to two scenarios: RMII mode with EMAC_CLK_OUT when
+                    the output clock is looped back externally, and RGMII mode when an optional
+                    50 MHz PHY_REF_CLK output is enabled (clock_phy_ref_gpio != -1).
+
+                config ETH_EMAC_PHY_REF_CLK_SRC_AUTO
+                    bool "Auto"
+                    help
+                        Let the driver select the clock source automatically based on the
+                        hardware abstraction layer defaults.
+                config ETH_EMAC_PHY_REF_CLK_SRC_MPLL
+                    bool "MPLL"
+                    depends on IDF_TARGET_ESP32S31
+                    help
+                        Use MPLL as the PHY reference clock source.
+                config ETH_EMAC_PHY_REF_CLK_SRC_CPLL
+                    bool "CPLL"
+                    depends on IDF_TARGET_ESP32S31
+                    help
+                        Use CPLL as the PHY reference clock source.
+            endchoice
+
+            choice ETH_EMAC_RGMII_TX_CLK_SRC
+                prompt "RGMII Tx clock source"
+                depends on SOC_EMAC_SUPPORT_1000M
+                default ETH_EMAC_RGMII_TX_CLK_SRC_AUTO
+                help
+                    Select the PLL clock source used to generate the EMAC RGMII Tx clock output.
+
+                config ETH_EMAC_RGMII_TX_CLK_SRC_AUTO
+                    bool "Auto"
+                    help
+                        Let the driver select the clock source automatically based on the
+                        hardware abstraction layer defaults.
+                config ETH_EMAC_RGMII_TX_CLK_SRC_MPLL
+                    bool "MPLL"
+                    depends on IDF_TARGET_ESP32S31
+                    help
+                        Use MPLL as the RGMII Tx clock source.
+                config ETH_EMAC_RGMII_TX_CLK_SRC_CPLL
+                    bool "CPLL"
+                    depends on IDF_TARGET_ESP32S31
+                    help
+                        Use CPLL as the RGMII Tx clock source.
+                config ETH_EMAC_RGMII_TX_CLK_SRC_APLL
+                    bool "APLL"
+                    depends on IDF_TARGET_ESP32S31
+                    help
+                        Use Audio PLL (APLL) as the RGMII Tx clock source.
+            endchoice
+
+        endmenu
+
+    endif # ETH_USE_ESP32_EMAC
+    menuconfig ETH_USE_SPI_ETHERNET
+        bool "Support SPI to Ethernet Module"
+        default y
+        select ETH_ENABLED
+        help
+            ESP-IDF can also support SPI-Ethernet. Actual chip drivers are available as components in
+            Component Registry.
+
+    menuconfig ETH_USE_OPENETH
+        bool "Support OpenCores Ethernet MAC (for use with QEMU)"
+        default n
+        select ETH_ENABLED
+        help
+            OpenCores Ethernet MAC driver can be used when an ESP-IDF application
+            is executed in QEMU. This driver is not supported when running on a
+            real chip.
+
+    if ETH_USE_OPENETH
+        config ETH_OPENETH_DMA_RX_BUFFER_NUM
+            int "Number of Ethernet DMA Rx buffers"
+            range 1 64
+            default 4
+            help
+                Number of DMA receive buffers, each buffer is 1600 bytes.
+
+        config ETH_OPENETH_DMA_TX_BUFFER_NUM
+            int "Number of Ethernet DMA Tx buffers"
+            range 1 64
+            default 1
+            help
+                Number of DMA transmit buffers, each buffer is 1600 bytes.
+    endif # ETH_USE_OPENETH
+
+    config ETH_TRANSMIT_MUTEX
+        depends on ETH_ENABLED
+        bool "Enable Transmit Mutex"
+        default n
+        help
+            Prevents multiple accesses when Ethernet interface is used as shared resource and multiple
+            functionalities might try to access it at a time.
+endmenu

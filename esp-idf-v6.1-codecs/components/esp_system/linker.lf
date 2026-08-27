@@ -1,0 +1,44 @@
+[mapping:esp_system]
+archive: libesp_system.a
+entries:
+    if ESP_PANIC_HANDLER_IRAM = y:
+        panic (noflash)
+        panic_handler (noflash)
+        panic_arch (noflash)
+        cache_err_int (noflash)
+        reset_reason:esp_reset_reason_get_hint (noflash)
+        if ESP_SYSTEM_HW_STACK_GUARD = y:
+            debug_assist:esp_hw_stack_guard_get_bounds (noflash)
+            debug_assist:esp_hw_stack_guard_get_fired_cpu (noflash)
+            debug_assist:esp_hw_stack_guard_get_pc (noflash)
+
+    # These functions are called when the cache is disabled
+    system_internal:esp_restart_noos (noflash)
+    system_internal:esp_system_reset_modules_on_exit (noflash)
+
+    if ESP_PANIC_HANDLER_IRAM = y || ESP_BROWNOUT_USE_INTR = y:
+        reset_reason:esp_reset_reason_set_hint (noflash)
+
+    # It may be called very frequently, so place it in IRAM to avoid performance degradation
+    freertos_hooks:esp_vApplicationTickHook (noflash)
+
+    if ESP_SYSTEM_IN_IRAM = y:
+        esp_err (noflash)
+        esp_system_chip:esp_system_abort (noflash)
+        panic:panic_abort (noflash)
+        if IDF_TARGET_ESP32 = y:
+            esp_system_chip:esp_restart_noos_dig (noflash)
+        system_time:esp_system_get_time (noflash)
+        system_time:esp_system_get_time_resolution (noflash)
+        ubsan (noflash)
+        if COMPILER_STACK_CHECK = y:
+            stack_check:__stack_chk_fail (noflash)
+
+    if APP_BUILD_TYPE_RAM = n:
+        image_process (noflash)
+
+[mapping:esp_system_hal]
+archive: libesp_hal_uart.a
+entries:
+    if ESP_PANIC_HANDLER_IRAM = y:
+        uart_hal_iram (noflash)

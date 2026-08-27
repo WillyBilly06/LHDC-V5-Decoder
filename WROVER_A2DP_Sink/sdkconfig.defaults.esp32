@@ -1,0 +1,94 @@
+# ================= ESP32-WROVER (classic Xtensa) target config =================
+
+# ---- Flash: 4 MB ----
+# The classic-ESP32 board in use is an ESP32-D0WD-V3 with a 4 MB Boya part
+# (mfr 0x68, dev 0x4016), NOT the 8 MB WROVER-N8R8. An 8 MB header on a 4 MB
+# chip aborts at boot in esp_flash_spi_init ("Detected size(4096k) smaller than
+# the size in the binary image header(8192k)"). 4 MB is also valid on the 8 MB
+# board, so one binary boots on both.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+
+# The chip is a Boya part; without its driver the generic one misreports geometry
+# and IDF warns "Detected boya flash chip but using generic driver".
+CONFIG_SPI_FLASH_SUPPORT_BOYA_CHIP=y
+
+# ---- Memory: internal SRAM only, no PSRAM ----
+# PSRAM was tried and REVERTED: the classic ESP32 shares ONE unified cache between
+# flash-resident code and PSRAM data across both cores. Any sustained PSRAM traffic
+# during decode (BT packets, or even just the output ring) evicts core 1's flash
+# decode code -> cache-miss storm -> the ~100%-budget 192k decoder falls to ~50%
+# throughput -> continuous drops + concealment. So PSRAM cannot help the hot 192k
+# path on this chip. Best achievable is the internal-only build (queue=32, ring
+# adaptive) = ~1 inaudible drop / 106 s. 44.1/48/96k are flawless.
+CONFIG_SPIRAM=n
+
+# ---- CPU at max 240 MHz (was defaulting to 160!) ----
+# LHDC 192k decode is compute-bound (fixed 5 ms frames, IMDCT-1920 = 4x the work
+# of 48k). At the 160 MHz default the A2DP_DECODER task pegged CPU1 at 100% and
+# still couldn't keep up -> "codec queue full" drops + IDLE1 watchdog. 240 MHz is
+# +50% compute -- the headroom 192k actually needs. Mains-powered speaker, so the
+# extra draw/heat is fine.
+CONFIG_ESP32_DEFAULT_CPU_FREQ_240=y
+CONFIG_ESP32_DEFAULT_CPU_FREQ_MHZ=240
+
+# ---- Don't watchdog the CPU1 idle task ----
+# Core 1 is the DEDICATED LHDC decode core (A2DP_TASK_PINNED_TO_CORE=1). At 192k
+# the decoder legitimately uses ~100% of it and keeps up (audio clean), so IDLE1
+# rarely runs and the idle-task watchdog false-alarms. Its 10-line backtrace print
+# every 5 s also steals UART time from the decode task. Disable the CPU1 idle
+# check (keep CPU0's) -- correct for a dedicated real-time core, not masking a hang.
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
+
+# ---- Per-core CPU-load measurement: OFF ----
+# RUN_TIME_STATS/TRACE_FACILITY add a timer read + bookkeeping on EVERY context
+# switch. That was affordable single-core, but dual-core decode adds 2 semaphore
+# switches per 5 ms frame (200 fps) on both cores, on top of the 1000 Hz tick --
+# the instrumentation was inflating the load it was measuring. Re-enable these two
+# (and the CPU block in main.c is #if-guarded on the first) only to re-measure.
+# CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS is not set
+# CONFIG_FREERTOS_USE_TRACE_FACILITY is not set
+
+# ---- Partition table: custom 4 MB app (full codec set), fits 8 MB flash ----
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_esp32_4mb.csv"
+
+# ---- Trim BT host/controller RAM (single-phone speaker) ----
+# A speaker only ever holds ONE ACL link to ONE phone, and does no SCO/HFP voice.
+# The defaults provision 2 controller links + 4 host ACL connections, whose
+# per-connection L2CAP/AVDTP buffers sit in internal DRAM and fragment the big
+# free bank. Collapsing to a single link frees that DRAM so the 192k output ring
+# (wants the full 128 KB contiguous) grabs the largest block it can on this
+# PSRAM-off chip. SYNC_CONN is already 0.
+CONFIG_BTDM_CTRL_BR_EDR_MAX_ACL_CONN=1
+CONFIG_BT_ACL_CONNECTIONS=1
+
+# ---- Balance the two cores for dual-core LHDC decode ----
+# With parallel channel decode, core 0 runs BT controller + BT host + I2S render
+# + channel-1 decode = 94% busy while core 1 (channel-0 decode) sits at 60%.
+# The radio CONTROLLER must stay on core 0, but the Bluedroid HOST stack does not:
+# moving it to core 1 shifts ~15-18% across, landing both cores near ~77% with
+# real headroom. It also stops the high-priority BTU task from preempting the
+# core-0 channel worker (which would stall the per-frame barrier).
+CONFIG_BT_BLUEDROID_PINNED_TO_CORE_1=y
+CONFIG_BTDM_CTRL_PINNED_TO_CORE_0=y
+
+# ---- BT allocations stay INTERNAL (do NOT route to PSRAM) ----
+# Tried BT_ALLOCATION_FROM_SPIRAM_FIRST: it freed byte-DRAM but HALVED decode
+# throughput. The classic ESP32 shares one cache between flash-resident code and
+# PSRAM data across both cores; routing every A2DP packet through PSRAM (core 0)
+# evicts core 1's flash decode code -> cache-miss storm -> ~2x slower decode ->
+# continuous drops. So the decoder's hot data (packets, workspace, tables) MUST
+# stay internal. byte-DRAM headroom instead comes from moving the OUTPUT RING to
+# PSRAM (render-side, sequential, not in the decode hot loop). See audio_sink_service_i2s.c.
+CONFIG_BT_BLUEDROID_MEM_DEBUG=n
+
+# ---- A2DP sink audio out over external I2S DAC ----
+CONFIG_EXAMPLE_A2DP_SINK_OUTPUT_EXTERNAL_I2S=y
+CONFIG_EXAMPLE_A2DP_SINK_USE_EXTERNAL_CODEC=n
+
+# ---- I2S output pins (ESP32-WROOM board in use) ----
+# LRCK/WS = GPIO25, DOUT = GPIO26, BCK/BCLK = GPIO27
+CONFIG_EXAMPLE_I2S_BCK_PIN=27
+CONFIG_EXAMPLE_I2S_LRCK_PIN=25
+CONFIG_EXAMPLE_I2S_DATA_PIN=26

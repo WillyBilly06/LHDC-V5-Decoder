@@ -1,0 +1,44 @@
+dependencies:
+  a2dp_sink_common_utils:
+    dependencies: []
+    source:
+      path: ../esp-idf-v6.1-codecs/examples/bluetooth/bluedroid/classic_bt/common/a2dp_utils/a2dp_sink_common_utils
+      type: local
+    version: '*'
+  a2dp_sink_ext_codec_utils:
+    dependencies: []
+    source:
+      path: ../esp-idf-v6.1-codecs/examples/bluetooth/bluedroid/classic_bt/common/a2dp_utils/a2dp_sink_ext_codec_utils
+      type: local
+    version: '*'
+  a2dp_sink_int_codec_utils:
+    dependencies: []
+    source:
+      path: ../esp-idf-v6.1-codecs/examples/bluetooth/bluedroid/classic_bt/common/a2dp_utils/a2dp_sink_int_codec_utils
+      type: local
+    version: '*'
+  bredr_app_common_utils:
+    dependencies: []
+    source:
+      path: ../esp-idf-v6.1-codecs/examples/bluetooth/bluedroid/classic_bt/common/bredr_app_common_utils
+      type: local
+    version: '*'
+  bt_app_core_utils:
+    dependencies: []
+    source:
+      path: ../esp-idf-v6.1-codecs/examples/bluetooth/bluedroid/classic_bt/common/bt_app_core_utils
+      type: local
+    version: '*'
+  idf:
+    source:
+      type: idf
+    version: 6.1.0
+direct_dependencies:
+- a2dp_sink_common_utils
+- a2dp_sink_ext_codec_utils
+- a2dp_sink_int_codec_utils
+- bredr_app_common_utils
+- bt_app_core_utils
+manifest_hash: 5a9748832cc9c69c2bf92be8541726ea8e54d5451cee345590f90f5d3782c16d
+target: esp32
+version: 3.0.0
