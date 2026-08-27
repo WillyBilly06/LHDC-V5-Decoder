@@ -2,6 +2,7 @@
 #define LHDC_DEC_INTERNAL_H
 
 #include "lhdc_dec.h"
+#include "lhdc_dec_slot.h"
 #include <stdint.h>
 
 /* Forward declaration - defined in lhdc_tables.h */
@@ -60,11 +61,42 @@ typedef struct {
     int32_t  noise_level[LHDC_DEC_MAX_SFB];
 } lhdc_dec_sns_params_t;
 
+/*
+ * Per-slot (= per-core) decode scratch. Everything here is written while ONE
+ * channel decodes, so with the two channels running concurrently each core needs
+ * its own copy. Slot 0's big buffers are carved from the decoder workspace tail
+ * (as before); slot 1's come from a SEPARATE malloc'd block (lhdc_dec_slot_alloc)
+ * so the single contiguous workspace does not grow — one 33 KB block plus one
+ * 14 KB block fit in byte-DRAM where a single 55 KB block does not.
+ *
+ * Buffers NOT duplicated (and why):
+ *   overlap_buf[ch] - already per-channel and persists across frames
+ *   payload_buf     - each channel touches only its own disjoint byte slice
+ *   header/config/band_cfg - read-only during channel decode
+ */
+typedef struct {
+    float   *mdct_in;        /* = w_buf : spectrum + IMDCT input (also int32 coeff scratch) */
+    float   *mdct_out;       /* = u_buf : IMDCT time output */
+    int32_t *quant_spectrum; /* = u_buf : entropy |coeff| (aliases mdct_out) */
+    uint8_t *ent_s1;         /* pass-1 ternary (num_coeffs) */
+    uint8_t *ent_s2;         /* pass-2 quotient ternary (num_coeffs*2) */
+
+    lhdc_dec_sns_params_t sns_params;
+    lhdc_dec_bit_reader_t bit_reader;
+    /* One channel's FAC byte stream (<= frame_bytes/2 <= MAX_FRAME_BYTES/2). */
+    uint8_t  fac_buf[768];
+    /* Saved pre-descramble channel header, for the selector retry (autosel path). */
+    uint8_t  hdr_save[8];
+    int      hdr_saved_start;
+    int64_t  chan_maxM;      /* this channel's peak |M| (desync indicator) */
+} lhdc_dec_slot_t;
+
 struct lhdc_decoder_t {
     lhdc_dec_config_t       config;
     lhdc_dec_frame_header_t header;
-    lhdc_dec_sns_params_t   sns_params;
     const lhdc_band_cfg_desc_t *band_cfg;
+
+    lhdc_dec_slot_t slot[LHDC_NSLOTS];
 
     /*
      * Work buffers, aggressively shared to minimise RAM. Decoding is sequential
@@ -92,24 +124,17 @@ struct lhdc_decoder_t {
      *   mdct_in / ch_pcm     -> shared w_buf  (lifetimes don't overlap)
      *   mdct_out / quant_spectrum -> shared u_buf
      */
-    float   *mdct_in;        /* = w_buf : spectrum + IMDCT input */
-    float   *ch_pcm;         /* = w_buf : per-channel PCM output (aliases mdct_in) */
-    float   *mdct_out;       /* = u_buf : IMDCT time output */
-    int32_t *quant_spectrum; /* = u_buf : entropy |coeff| (aliases mdct_out) */
+    float   *ch_pcm;         /* = slot0 w_buf : PCM out for the sequential path */
     float   *overlap_buf[LHDC_DEC_MAX_CHANNELS];
-    float   *pcm_mid;        /* ch0 (mid) PCM held while ch1 decodes; stereo only */
+    float   *pcm_mid;        /* ch0 PCM (dual-core: ch0's dedicated output) */
+#if LHDC_NSLOTS > 1
+    float   *pcm_r;          /* ch1's dedicated output (occupies ov_save's slot) */
+#else
     float   *ov_save;        /* clip-recovery overlap snapshot (H floats); was .bss */
+#endif
     int      alloc_mdct_size;/* mdct_size the tail buffers were carved for */
 
-    lhdc_dec_bit_reader_t bit_reader;
     uint8_t  payload_buf[LHDC_DEC_MAX_FRAME_BYTES];  /* descrambled frame payload */
-
-    /* Entropy-decode scratch. fac_buf holds the FAC byte stream (one channel's
-     * bytes, well under 1.5KB). ent_s1 = pass-1 ternary (one per coeff). ent_s2 =
-     * pass-2 quotient ternary; both rate-sized in the tail block. */
-    uint8_t  fac_buf[768];   /* one channel's FAC bytes <= frame_bytes/2 <= MAX_FRAME_BYTES/2 = 768 */
-    uint8_t  *ent_s1;
-    uint8_t  *ent_s2;
 
     uint32_t frame_index;
     uint8_t  initialized;

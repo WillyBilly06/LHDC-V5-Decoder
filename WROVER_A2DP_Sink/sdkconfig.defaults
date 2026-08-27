@@ -1,0 +1,54 @@
+# ESP32-WROVER A2DP sink — Bluetooth Classic + full codec set (incl. LHDC-V5).
+# Target-specific config (flash size, PSRAM, partition, I2S pins) lives in
+# sdkconfig.defaults.esp32.
+CONFIG_BT_ENABLED=y
+CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY=y
+CONFIG_BT_BLUEDROID_ENABLED=y
+CONFIG_BT_CLASSIC_ENABLED=y
+CONFIG_BT_A2DP_ENABLE=y
+CONFIG_BT_BLE_ENABLED=n
+CONFIG_DAC_DMA_AUTO_16BIT_ALIGN=n
+
+# Bluetooth device name shown to phones/PCs when pairing
+CONFIG_EXAMPLE_LOCAL_DEVICE_NAME="ESP32-WROVER-Speaker"
+
+# Build the whole project at -O2 (Perf), not the IDF-default -Og (Debug) —
+# needed for real-time LHDC decode (the code around the -O3 math kernels).
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# FreeRTOS tick at 1000 Hz (1 ms) instead of the 100 Hz (10 ms) default. Finer
+# scheduling granularity for the real-time decode + I2S render tasks -> less
+# task-wakeup latency/jitter feeding the output ring (helps avoid underflow).
+CONFIG_FREERTOS_HZ=1000
+
+# Extended A2DP vendor codec decoders (in-stack decode)
+CONFIG_BT_A2DP_APTX_DECODER=y
+CONFIG_BT_A2DP_LDAC_DECODER=y
+CONFIG_BT_A2DP_OPUS_DECODER=y
+CONFIG_BT_A2DP_LHDCV5_DECODER=y
+CONFIG_BT_A2DP_LC3PLUS_DECODER=y
+CONFIG_BT_A2DP_AAC_DECODER=y
+
+# Console UART at 921600 instead of 115200.
+#
+# ESP_LOGx writes to the console SYNCHRONOUSLY and blocks the calling task until
+# the bytes are out. At 115200 that is ~87 us per character, so one ~120-char log
+# line costs ~10 ms -- twice the entire 5 ms LHDC frame budget. The periodic
+# HEAP/DEC-STACK/LHDC-RT lines are three of them back to back (~31 ms), which is
+# why playback audibly stutters exactly when the monitor prints. At 921600 the
+# same three lines cost ~4 ms total.
+#
+# NOTE: the serial monitor must now connect at 921600 (idf.py monitor reads this
+# from sdkconfig automatically; a separate terminal needs it set by hand).
+# The baud rate is only settable when the console channel is CUSTOM:
+#   config ESP_CONSOLE_UART_BAUDRATE
+#       prompt "UART console baud rate" if ESP_CONSOLE_UART_CUSTOM
+# With ESP_CONSOLE_UART_DEFAULT=y, kconfig silently forces it back to 115200,
+# which is exactly what happened the first time this was set. Select CUSTOM
+# UART0 on the same pins the default uses (GPIO1/GPIO3 on the ESP32), so the
+# only thing that actually changes is the speed.
+CONFIG_ESP_CONSOLE_UART_CUSTOM=y
+CONFIG_ESP_CONSOLE_UART_CUSTOM_NUM_0=y
+CONFIG_ESP_CONSOLE_UART_TX_GPIO=1
+CONFIG_ESP_CONSOLE_UART_RX_GPIO=3
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=921600

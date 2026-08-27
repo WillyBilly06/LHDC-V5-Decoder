@@ -1,0 +1,16 @@
+# Classic-ESP32 target: sized for a 4 MB flash.
+#
+# The board on hand is an ESP32-D0WD-V3 with a 4 MB Boya (mfr 0x68, dev 0x4016)
+# chip, not the 8 MB WROVER-N8R8. The shared partitions.csv gives factory
+# 0x400000 at 0x10000, which ends at 0x410000 -- past the end of a 4 MB part, so
+# the flash probe aborts at boot ("Detected size(4096k) smaller than the size in
+# the binary image header(8192k)").
+#
+# 3 MB of app is ~2.7x what the image needs (~1.1 MB with all six codecs), and
+# this table is equally valid on an 8 MB board, so both classic-ESP32 boards boot
+# the same binary.
+#
+# Name,   Type, SubType, Offset,  Size
+nvs,      data, nvs,     0x9000,  0x6000,
+phy_init, data, phy,     0xf000,  0x1000,
+factory,  app,  factory, 0x10000, 0x300000,

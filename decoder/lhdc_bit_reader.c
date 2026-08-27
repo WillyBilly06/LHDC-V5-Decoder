@@ -1,6 +1,15 @@
 #include "lhdc_bit_reader.h"
 #include <string.h>
 
+/* Bit reader called on essentially every coefficient/symbol read -> keep the tiny
+ * hot fns in IRAM to avoid flash cache-miss stalls under BT IRQs. (HOST: no-op.) */
+#if !defined(LHDC_HOST_BUILD)
+  #include "esp_attr.h"
+  #define LHDC_HOT IRAM_ATTR
+#else
+  #define LHDC_HOT
+#endif
+
 void lhdc_bit_reader_init(lhdc_dec_bit_reader_t *br, const uint8_t *data, size_t data_bytes)
 {
     br->data = data;
@@ -10,7 +19,7 @@ void lhdc_bit_reader_init(lhdc_dec_bit_reader_t *br, const uint8_t *data, size_t
     br->cache_bits = 0;
 }
 
-static void lhdc_bit_reader_refill(lhdc_dec_bit_reader_t *br, int need_bits)
+static LHDC_HOT void lhdc_bit_reader_refill(lhdc_dec_bit_reader_t *br, int need_bits)
 {
     while (br->cache_bits < need_bits && br->byte_pos < br->data_bytes) {
         br->cache = (br->cache << 8) | br->data[br->byte_pos++];
@@ -18,7 +27,7 @@ static void lhdc_bit_reader_refill(lhdc_dec_bit_reader_t *br, int need_bits)
     }
 }
 
-uint32_t lhdc_bit_reader_read(lhdc_dec_bit_reader_t *br, int num_bits)
+LHDC_HOT uint32_t lhdc_bit_reader_read(lhdc_dec_bit_reader_t *br, int num_bits)
 {
     if (num_bits <= 0) return 0;
     if (num_bits > 32) num_bits = 32;
@@ -40,7 +49,7 @@ uint32_t lhdc_bit_reader_read(lhdc_dec_bit_reader_t *br, int num_bits)
     return val;
 }
 
-uint32_t lhdc_bit_reader_peek(lhdc_dec_bit_reader_t *br, int num_bits)
+LHDC_HOT uint32_t lhdc_bit_reader_peek(lhdc_dec_bit_reader_t *br, int num_bits)
 {
     if (num_bits <= 0) return 0;
     if (num_bits > 32) num_bits = 32;
@@ -55,7 +64,7 @@ uint32_t lhdc_bit_reader_peek(lhdc_dec_bit_reader_t *br, int num_bits)
     return (uint32_t)((br->cache >> shift) & ((1ULL << num_bits) - 1));
 }
 
-void lhdc_bit_reader_skip(lhdc_dec_bit_reader_t *br, int num_bits)
+LHDC_HOT void lhdc_bit_reader_skip(lhdc_dec_bit_reader_t *br, int num_bits)
 {
     if (num_bits <= 0) return;
 
@@ -89,7 +98,7 @@ void lhdc_bit_reader_align_byte(lhdc_dec_bit_reader_t *br)
     }
 }
 
-int lhdc_bit_reader_read_flag(lhdc_dec_bit_reader_t *br)
+LHDC_HOT int lhdc_bit_reader_read_flag(lhdc_dec_bit_reader_t *br)
 {
     return (int)lhdc_bit_reader_read(br, 1);
 }
