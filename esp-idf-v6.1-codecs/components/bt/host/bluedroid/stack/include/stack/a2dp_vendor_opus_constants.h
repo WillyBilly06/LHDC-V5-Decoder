@@ -1,0 +1,60 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+//
+// A2DP constants for Opus codec
+//
+
+#ifndef A2DP_VENDOR_OPUS_CONSTANTS_H
+#define A2DP_VENDOR_OPUS_CONSTANTS_H
+
+#define A2DP_OPUS_VARIANT_ANDROID 0
+#define A2DP_OPUS_VARIANT_PIPEWIRE 1
+
+// Android A2DP Opus uses Google's Bluetooth SIG company ID.
+#define A2DP_OPUS_ANDROID_VENDOR_ID 0x000000e0
+#define A2DP_OPUS_ANDROID_CODEC_ID 0x0001
+
+// PipeWire/BlueZ Opus 05, used by Linux today.
+#define A2DP_OPUS_PIPEWIRE_VENDOR_ID 0x000005f1
+#define A2DP_OPUS_PIPEWIRE_CODEC_ID 0x1005
+
+// Keep the generic Opus constants mapped to Android for Android framework APIs.
+#define A2DP_OPUS_VENDOR_ID A2DP_OPUS_ANDROID_VENDOR_ID
+#define A2DP_OPUS_CODEC_ID A2DP_OPUS_ANDROID_CODEC_ID
+
+// Opus codec specific settings
+#define A2DP_OPUS_ANDROID_CODEC_LEN 9
+#define A2DP_OPUS_PIPEWIRE_CODEC_LEN 26
+#define A2DP_OPUS_CODEC_LEN A2DP_OPUS_ANDROID_CODEC_LEN
+
+// [Octet 6], [Bits 0-2] Channel Mode
+#define A2DP_OPUS_CHANNEL_MODE_MASK 0x07
+#define A2DP_OPUS_CHANNEL_MODE_MONO 0x01
+#define A2DP_OPUS_CHANNEL_MODE_STEREO 0x02
+#define A2DP_OPUS_CHANNEL_MODE_DUAL_MONO 0x04
+
+// [Octet 6], [Bits 3-4] Frame Size
+#define A2DP_OPUS_FRAMESIZE_MASK 0x18
+#define A2DP_OPUS_10MS_FRAMESIZE 0x08
+#define A2DP_OPUS_20MS_FRAMESIZE 0x10
+
+// [Octet 6], [Bit 7] Sampling Frequency
+#define A2DP_OPUS_SAMPLING_FREQ_MASK 0x80
+#define A2DP_OPUS_SAMPLING_FREQ_48000 0x80
+
+// PipeWire/BlueZ Opus 05 audio location configuration.
+#define A2DP_OPUS_AUDIO_LOCATION_FL 0x00000001
+#define A2DP_OPUS_AUDIO_LOCATION_FR 0x00000002
+
+// PipeWire/BlueZ Opus 05 frame duration flags.
+#define A2DP_OPUS_FRAME_DURATION_2_5 0x01
+#define A2DP_OPUS_FRAME_DURATION_5_0 0x02
+#define A2DP_OPUS_FRAME_DURATION_10  0x04
+#define A2DP_OPUS_FRAME_DURATION_20  0x08
+#define A2DP_OPUS_FRAME_DURATION_40  0x10
+
+#define A2DP_OPUS_FRAME_BITRATE_ALL 0x0
+
+#endif  // A2DP_VENDOR_OPUS_CONSTANTS_H
