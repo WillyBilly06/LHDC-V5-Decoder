@@ -344,6 +344,46 @@ The `a2dp_integration/` layer plugs the decoder into Bluedroid's vendor-codec si
 The decode runs on Bluedroid's A2DP sink task. Pin that task and your audio render task to
 **different cores** so decode doesn't starve the I2S writer.
 
+### Sink-side requirements that are NOT the decoder's job
+
+Everything below was found while getting 192 kHz/24-bit to play cleanly on a classic
+ESP32. None of it is a decoder bug -- the decoder held `over=0` frames per 1000 against
+a 5 ms budget throughout -- but each one produced audible stutter that looks exactly
+like a slow decoder, so they are worth knowing before you blame this library.
+
+**1. Never drop on a full output ring.** If your PCM ring uses a zero timeout, a burst
+of arrivals destroys audio you will need 200 ms later, and you then underflow by
+approximately the amount discarded. Measured over 13.5 s at 192 kHz: 20,582,400 B
+accepted + 245,760 B dropped = **100.04% of realtime offered** -- the source was
+essentially exact, delivery was merely bursty. Let the ring write *wait* (20 ms is
+ample; a 192 kHz render drains ~1.5 MB/s) so the burst backs up into the A2DP receive
+queue in **encoded** form, ~250 B per 5 ms frame instead of 7680 B of PCM -- about 30x
+cheaper per unit of buffered time.
+
+**2. Size the ring from measured free memory, not a constant.** On the classic ESP32
+the ring, this decoder's work buffers, the A2DP task stack and every BT media packet
+come from one small byte-addressable pool. Allocate the ring *after* `decoder_configure`
+and take `free(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT) - reserve`; 192 kHz then
+automatically gets a smaller ring than 48 kHz with no rate table. Watch out for other
+codecs leaking into that pool -- a missing `aac_decoder_deinit()` elsewhere in our tree
+held ~27 KB for the whole session and silently halved the LHDC ring.
+
+**3. Track the source's clock, or accept a periodic gap.** The phone and your board run
+off different crystals. Measured here: **~127 ppm**, which drained a 44 KB ring in about
+3-4 minutes, every time, forever -- a brief stutter then clean again. No buffer size
+fixes this; it only sets the interval. Use `i2s_channel_tune_rate()` (its stated purpose
+is "fine-tuning the mclk to match the speed of producer and consumer") driven by the
+ring fill level, following the control structure in ESP-IDF's `i2s_usb` example: act
+only on a sustained trend, step ~10 ppm, and disable the channel around the change.
+
+**4. Logging is not free.** `ESP_LOGx` blocks the calling task until the bytes leave the
+UART. At 115200 one ~120-character line is ~10 ms -- **two entire 5 ms frame budgets**.
+A periodic three-line status print was ~31 ms and audibly stuttered playback on its own.
+Raise the console baud (note `CONFIG_ESP_CONSOLE_UART_BAUDRATE` is only settable with
+`ESP_CONSOLE_UART_CUSTOM=y`; with the default channel kconfig silently forces 115200
+back -- verify in `build/config/sdkconfig.h`, not `sdkconfig`), and rate-limit anything
+in the decode path.
+
 ---
 
 ## 192 kHz / PSRAM build
