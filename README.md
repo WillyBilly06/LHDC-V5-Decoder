@@ -108,6 +108,37 @@ needed when wiring the decoder into a Bluedroid A2DP sink.
 
 ---
 
+## The bundled ESP-IDF fork (`esp-idf-v6.1-codecs/`)
+
+If you would rather have a tree that already works than integrate the decoder
+yourself, `esp-idf-v6.1-codecs/` is a **complete, self-contained snapshot of
+ESP-IDF v6.1** with this decoder (and an AAC-LC decoder) already wired into
+Bluedroid's A2DP sink path, plus the worked sink application under
+`examples/bluetooth/bluedroid/classic_bt/`.
+
+Every submodule Espressif normally pulls in (BT controller blobs, PHY, WiFi,
+mbedTLS, NimBLE, …) is vendored as ordinary files, so there is **no submodule
+step** — a plain clone builds:
+
+```
+cd esp-idf-v6.1-codecs
+. ./export.sh          # export.ps1 on Windows
+idf.py set-target esp32
+idf.py build
+```
+
+See `esp-idf-v6.1-codecs/README-FORK.md` for exactly what differs from stock
+v6.1. Note this makes the repository large (~110 MB fetched); if you only want
+the decoder, `decoder/` is self-contained and you can ignore that folder
+entirely, or use a partial clone:
+
+```
+git clone --filter=blob:none --sparse https://github.com/WillyBilly06/LHDC-V5-Decoder.git
+cd LHDC-V5-Decoder && git sparse-checkout set decoder a2dp_integration docs test
+```
+
+---
+
 ## Add to your ESP-IDF project
 
 This repo **is** a self-contained ESP-IDF component. Drop it into your project's
