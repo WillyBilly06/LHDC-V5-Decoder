@@ -41,7 +41,8 @@ static uint32_t s_fd_count = 0;   /* reset per stream in configure */
 #define LHDCV5_MAX_PCM_BYTES     (4 * 2000)
 
 /*
- * The decoder workspace (~39 KB) is allocated from the MAIN internal heap via
+ * The decoder workspace (now just the lhdc_decoder_t struct) is allocated from
+ * the MAIN internal heap via
  * heap_caps_malloc(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT), NOT osi_malloc. The
  * bluedroid/osi heap fragments down to a ~15 KB largest free block during a
  * call, so osi_malloc(39 KB) fails there ("cannot allocate" -> NULL decoder ->
@@ -51,8 +52,8 @@ static uint32_t s_fd_count = 0;   /* reset per stream in configure */
  */
 #define LHDCV5_WS_CAPS (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
 typedef struct {
-    void *workspace;             /* heap block holding the lhdc_decoder_t + rate-sized tail */
-    size_t workspace_size;       /* bytes currently allocated (rate-sized) */
+    void *workspace;             /* heap block holding the lhdc_decoder_t (struct only) */
+    size_t workspace_size;       /* bytes currently allocated */
     lhdc_decoder_t *decoder;
     int fragment_size;
     int fragment_count;
@@ -95,9 +96,14 @@ void a2dp_lhdcv5_decoder_cleanup(void) {
     lhdc_imdct_free_1920();   /* 192k tables (missed before -> leaked at 192 kHz) */
     lhdc_imdct_free_cos();    /* reference-IMDCT cosine table (~30 KB, was never freed) */
     lhdc_dec_free_window();   /* KBD window (was only freed on rate change) */
+    lhdc_dec_free_slot_scratch(); /* 2nd core's decode scratch (dual-core channel decode) */
     lhdc_entropy_free();
     tA2DP_LHDCV5_DECODER_CB *cb = s_lhdc_cb;
     if (!cb) return;
+    if (cb->decoder) {
+        lhdc_dec_deinit(cb->decoder);   /* split-workspace: free the rate-sized work buffers */
+        cb->decoder = NULL;
+    }
     if (cb->workspace) {
         heap_caps_free(cb->workspace);
     }
@@ -145,24 +151,29 @@ void a2dp_lhdcv5_decoder_configure(const uint8_t* p_codec_info) {
 
     config.channels = 2;
 
-    /* GROW-ONLY workspace, MAX-SIZED for 192k (mdct 1920 = 32,544 B) on the FIRST
-     * LHDC config, then REUSED for every rate with zero realloc.
+    /* SPLIT WORKSPACE. This block is now only the rate-independent
+     * lhdc_decoder_t struct; the rate-sized work buffers (largest ~7.7 KB at
+     * 192k) are allocated individually inside lhdc_dec_init.
      *
-     * Why: rate-sized grow-only can't get 192k to allocate -- the phone connects
-     * 48k first (10 KB ws), then the 48k->192k switch must grow to 32.5 KB, but
-     * streaming has fragmented the heap (largest hole seen as low as 18 KB) so the
-     * 32.5 KB malloc fails -> dec=NULL -> no 192k. Grabbing the full 32.5 KB on the
-     * first config (heap still pristine, ~70+ KB largest) and never realloc'ing
-     * GUARANTEES 192k fits AND keeps the heap stable across LHDC rate switches.
-     * The earlier max-size attempt was reverted ONLY because it had no headroom
-     * (starved 48k/96k to near-OOM); it is now paired with RAM reclaim (lazy/
-     * smaller overlay-mixer ring + smaller audio jitter ring, ~12 KB) so 48k/96k
-     * keep workable free heap. The block frees when the active codec leaves LHDC. */
+     * Why it changed: the old design needed ONE contiguous 32,544-byte block for
+     * 192k. On the classic ESP32 only ~82 KB of the internal heap is byte-
+     * addressable, and BT streaming fragments it down to holes far below 32 KB,
+     * so 192k could only be reached by grabbing the max-sized slab on the very
+     * first LHDC config and never releasing it -- which starved the rest of the
+     * heap at 48k/96k. Splitting removes the contiguity requirement entirely:
+     * every request is small enough to satisfy from a fragmented heap, and the
+     * buffers are rate-sized again (48k costs a quarter of 192k).
+     *
+     * It must be zero-initialized: lhdc_dec_init frees the previous rate's
+     * buffers before re-carving, so it must never see garbage pointers. */
     {
         size_t need = lhdc_dec_get_workspace_size(LHDC_DEC_SR_192000, config.frame_duration);
         if (!cb->workspace || cb->workspace_size < need) {
             if (cb->workspace) heap_caps_free(cb->workspace);
             cb->workspace = heap_caps_malloc(need, LHDCV5_WS_CAPS);
+            if (cb->workspace) {
+                memset(cb->workspace, 0, need);   /* no garbage tail pointers on first init */
+            }
             if (!cb->workspace) {
                 cb->workspace_size = 0;
                 LHDCV5_LOGE("configure: cannot allocate %u-byte workspace (largest free %u)",
@@ -171,7 +182,7 @@ void a2dp_lhdcv5_decoder_configure(const uint8_t* p_codec_info) {
                 return;
             }
             cb->workspace_size = need;
-            LHDCV5_LOGI("configure: workspace %u bytes (max-sized for 192k; rate=%u)",
+            LHDCV5_LOGI("configure: workspace %u bytes (struct only; work buffers split; rate=%u)",
                         (unsigned)need, (unsigned)config.sample_rate);
         }
     }

@@ -86,6 +86,34 @@ static float sns_band_gain(int32_t sf)
     return (float)LHDC_POW2_MANT[idx] * scale;
 }
 
+/* Reciprocal of sns_band_gain WITHOUT a float divide.
+ *
+ * The Xtensa LX6 FPU has no divide instruction, so `1.0f / g` compiles to a
+ * SOFTWARE __divsf3 call (~80 cycles) -- and it ran once per band, per channel,
+ * per frame (32 x 2 x 200 fps = ~12.8k/s). Since sns_band_gain returns
+ * mant * 2^-k with an EXACT power-of-two scale, 1/g = (1/mant) * 2^k, and scaling
+ * by a power of two only changes the exponent (never the mantissa). So a
+ * precomputed 1/mant table yields a BIT-IDENTICAL result using a single FPU
+ * multiply. The table costs 644 B of .bss and is built once (cold). */
+static float s_pow2_mant_recip[sizeof(LHDC_POW2_MANT) / sizeof(int32_t)];
+static int   s_pow2_mant_recip_built = 0;
+
+static float sns_band_gain_recip(int32_t sf)
+{
+    const int n = (int)(sizeof(LHDC_POW2_MANT) / sizeof(int32_t));
+    int idx;
+    float inv_scale;
+    if (sf >= 0) { idx = sf >> 4;            inv_scale = 0x1p20f; }  /* 1 / 2^-20 */
+    else         { idx = (sf + 0xa0f) >> 4;  inv_scale = 0x1p30f; }  /* 1 / 2^-30 */
+    if (idx < 0) idx = 0;
+    if (idx >= n) idx = n - 1;
+    if (!s_pow2_mant_recip_built) {
+        for (int i = 0; i < n; i++) s_pow2_mant_recip[i] = 1.0f / (float)LHDC_POW2_MANT[i];
+        s_pow2_mant_recip_built = 1;
+    }
+    return s_pow2_mant_recip[idx] * inv_scale;
+}
+
 /* floor division matching Python's // (for negative numerators). 32-bit: the
  * only caller passes a sum of <=32 small scale-factors and n<=32, which fit in
  * int32 with huge margin, so this uses the ESP32's HARDWARE 32-bit divide
@@ -113,10 +141,14 @@ static inline int32_t sns_div_euclid_pos(int32_t a, int32_t b)
     if (r < 0) q -= 1;   /* b > 0 */
     return q;
 }
-/* div_round(x, 4) = (x + 2).div_euclid(4)  (reference math::div_round). */
+/* div_round(x, 4) = (x + 2).div_euclid(4)  (reference math::div_round).
+ * div_euclid by a POSITIVE power of two is exactly floor(x / 2^k), and an
+ * ARITHMETIC right shift on two's complement already floors toward -inf for
+ * negative values -- so this is a single sra, no divide and no remainder.
+ * Bit-identical to sns_div_euclid_pos(x + 2, 4) for every int32 input. */
 static inline int32_t sns_div_round4(int32_t x)
 {
-    return sns_div_euclid_pos(x + 2, 4);
+    return (x + 2) >> 2;
 }
 /* div::<3>(x) = (x * floor(2^31/3)) >> 31  (reference math::div, N=3). This is
  * (x-1)/3 for positive x and (x-2)/3 for negative x, NOT ordinary /3. */
@@ -145,6 +177,7 @@ static inline int32_t sns_div3(int32_t x)
 static void sns_post_smooth(int32_t *sf, int n)
 {
     (void)sns_floordiv;
+    (void)sns_div_euclid_pos;   /* kept as the documented reference for div_round4 */
     if (n < 4) return;   /* real configs use 24 or 32 segments */
     int64_t num_inv = (n == 24) ? 89478485 : 67108864;   /* round(2^31 / n) */
 
@@ -238,9 +271,8 @@ LHDC_HOT void lhdc_sns_synth_apply(float *spectrum,
 #elif defined(LHDC_GAIN_POS)
         g = powf(2.0f,  (float)sf / 16.0f);
 #else
-        g = sns_band_gain(sf);
-        if (sns_dir == 1) { /* multiply */ }
-        else { g = (g != 0.0f) ? 1.0f / g : 0.0f; }   /* divide-POW2 (verified) */
+        if (sns_dir == 1) { g = sns_band_gain(sf); }        /* multiply */
+        else              { g = sns_band_gain_recip(sf); }  /* divide-POW2, no __divsf3 */
 #endif
         for (int k = start; k < end; k++) spectrum[k] *= g;
     }

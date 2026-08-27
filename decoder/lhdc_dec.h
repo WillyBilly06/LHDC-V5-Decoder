@@ -95,19 +95,52 @@ typedef struct {
 typedef struct lhdc_decoder_t lhdc_decoder_t;
 
 /*
- * Get the required workspace size for the decoder at a given rate. The work
- * buffers are rate-sized (mdct_size from the band config), so 48k needs far
- * less than 96k. Pass the negotiated sample_rate and frame_duration (ms).
+ * Get the required workspace size. With the split-workspace design the decoder
+ * allocates its rate-sized work buffers itself (each <= ~7.7 KB), so this only
+ * covers the rate-independent struct. sample_rate/frame_duration are accepted
+ * for API compatibility and ignored.
  */
 size_t lhdc_dec_get_workspace_size(uint32_t sample_rate, uint8_t frame_duration);
 
 /*
  * Initialize a decoder instance.
- * workspace: pre-allocated buffer of size lhdc_dec_get_workspace_size()
+ * workspace: pre-allocated struct storage of size lhdc_dec_get_workspace_size(),
+ *            ZERO-INITIALIZED before the first call (lhdc_dec_init frees the
+ *            previous rate's work buffers, so it must not see garbage pointers)
  * config:    decoder configuration (may be NULL for auto-detect from bitstream)
  * Returns a decoder handle, or NULL on failure.
  */
 lhdc_decoder_t *lhdc_dec_init(void *workspace, const lhdc_dec_config_t *config);
+
+/*
+ * Destroy a decoder instance: frees the rate-sized work buffers that the
+ * decoder allocated itself (split-workspace design). The caller still owns
+ * the `workspace` block (struct storage) and frees it separately.
+ */
+void lhdc_dec_deinit(lhdc_decoder_t *dec);
+
+/*
+ * Frame-latency telemetry. An LHDC V5 frame is 5 ms of audio (2.5 ms in
+ * low-latency mode) and holds BOTH channels, so a full decode_frame call must
+ * finish inside `budget_us` or the output ring starves. The decoder only keeps
+ * counters (no logging in the audio path); call this from a low-priority task to
+ * read and reset them.
+ *   frames      - frames timed since the last reset
+ *   avg_us/max_us - mean and worst full-frame decode time
+ *   over        - frames that exceeded budget_us
+ *   budget_us   - frame_duration_ms * 1000 for the running config
+ *   worst_bytes - encoded size of the worst frame (i.e. how hot the bitrate was)
+ */
+typedef struct {
+    uint32_t frames;
+    uint32_t avg_us;
+    uint32_t max_us;
+    uint32_t over;
+    uint32_t budget_us;
+    uint32_t worst_bytes;
+} lhdc_dec_latency_t;
+
+void lhdc_dec_latency_stats(lhdc_dec_latency_t *out, int reset);
 
 /*
  * Decode one frame.
@@ -152,6 +185,10 @@ const char *lhdc_dec_strerror(lhdc_dec_ret_t ret);
 
 /* Free the module-static KBD analysis window (call at decoder teardown). */
 void lhdc_dec_free_window(void);
+
+/* Release the second decode slot's scratch block (dual-core channel decode on the
+ * classic ESP32). No-op on single-core/host builds. Call at decoder teardown. */
+void lhdc_dec_free_slot_scratch(void);
 
 #ifdef __cplusplus
 }
